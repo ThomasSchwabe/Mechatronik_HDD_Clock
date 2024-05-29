@@ -2,7 +2,7 @@
 
 #include "driver/gptimer.h"
 
-class Timer
+class HWTimer
 {
 private:
     gptimer_config_t config;
@@ -12,7 +12,9 @@ private:
 
 public:
     // Konstruktor
-    Timer(uint64_t alarm_count, bool auto_reload, gptimer_alarm_cb_t cb_function, int intr_priority = 0, uint32_t resolution_hz = 1000000)
+    HWTimer() : handle(nullptr) {}
+
+    HWTimer(uint64_t alarm_count, bool auto_reload, gptimer_alarm_cb_t cb_function, int intr_priority = 0, uint32_t resolution_hz = 1000000)
     {
         config.clk_src = GPTIMER_CLK_SRC_DEFAULT;
         config.direction = GPTIMER_COUNT_UP;

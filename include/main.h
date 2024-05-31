@@ -9,5 +9,8 @@
 #include <vector>
 #include <stdexcept>
 #include <algorithm>
+#include <math.h>
+
+#include "bldc.h"
 
 #define SIMULATION_MODE true

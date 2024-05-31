@@ -32,7 +32,7 @@ const uint8_t BLDC_DRV_EN1 = 13;
 const uint8_t BLDC_DRV_EN2 = 12;
 const uint8_t BLDC_DRV_EN3 = 14;
 const uint8_t BLDC_MOTOR_POLE = 7;
-// UcnBrushlessDCMotorPWM _bldc;
+BLDC bldc;
 volatile unsigned long t_bldc_delay = 350;
 
 // Rotation time variables
@@ -67,175 +67,26 @@ gptimer_handle_t timerHandle_hall = NULL;
 void task_bldc(void *pvParameters);
 void task_leds(void *pvParameters);
 
-// Interupt Functions
-static bool IRAM_ATTR isr_bldc_startup(gptimer_handle_t timer, const gptimer_alarm_event_data_t *edata, void *user_ctx);
-static bool IRAM_ATTR isr_hall_simulation(gptimer_handle_t timer, const gptimer_alarm_event_data_t *edata, void *user_ctx);
-static void IRAM_ATTR isr_hall(void *arg);
-static bool IRAM_ATTR isr_leds_activate(gptimer_handle_t timer, const gptimer_alarm_event_data_t *edata, void *user_ctx);
-static bool IRAM_ATTR isr_leds_deactivate(gptimer_handle_t timer, const gptimer_alarm_event_data_t *edata, void *user_ctx);
-
 // Functions
-
-// MAIN
-extern "C" void app_main(void)
-{
-    if (symbols.length() != led_pins.size())
-    {
-        ESP_LOGE(LOG_TAG, "num of symbols does not match num of led_gpios");
-    }
-    else
-    {
-        xTaskCreatePinnedToCore(task_leds, "Task LEDs", 4096, NULL, 1, &taskHandle_leds, 0);
-        xTaskCreatePinnedToCore(task_bldc, "Task BLDC", 4096, NULL, 1, &taskHandle_bldc, 1); // only task_bldc on core 1 allowed
-    }
-}
-
-void task_bldc(void *pvParameters)
-{
-    gptimer_config_t timerConfig_bldc;
-    timerConfig_bldc.clk_src = GPTIMER_CLK_SRC_DEFAULT;
-    timerConfig_bldc.direction = GPTIMER_COUNT_UP;
-    timerConfig_bldc.resolution_hz = 1000000;
-    timerConfig_bldc.intr_priority = 1;
-    ESP_ERROR_CHECK(gptimer_new_timer(&timerConfig_bldc, &timerHandle_bldc));
-
-    gptimer_alarm_config_t timerAlarm_bldc;
-    timerAlarm_bldc.alarm_count = 1000000; // TODO: set start count to right value
-    timerAlarm_bldc.reload_count = 0;
-    timerAlarm_bldc.flags.auto_reload_on_alarm = true;
-    ESP_ERROR_CHECK(gptimer_set_alarm_action(timerHandle_bldc, &timerAlarm_bldc));
-
-    gptimer_event_callbacks_t timerCb_bldc;
-    timerCb_bldc.on_alarm = isr_bldc_startup;
-    ESP_ERROR_CHECK(gptimer_register_event_callbacks(timerHandle_bldc, &timerCb_bldc, NULL));
-
-    ESP_ERROR_CHECK(gptimer_enable(timerHandle_bldc));
-    ESP_ERROR_CHECK(gptimer_start(timerHandle_bldc));
-
-    while (true)
-    {
-        //_bldc.DoRotate(); //TODO: include or port bldc library to espidf
-        delay(t_bldc_delay);
-    }
-}
-
-void task_leds(void *pvParameters)
-{
-    // initialise chambers
-    for (int pin : led_pins)
-    {
-        ESP_ERROR_CHECK(gpio_set_direction(static_cast<gpio_num_t>(pin), GPIO_MODE_OUTPUT));
-        Chamber chamber = {
-            .pin = (gpio_num_t)pin,
-            .symbol = symbols[0],
-            .time = 0,
-        };
-        chambers.push_back(chamber);
-    }
-
-    // hall interrupt setup and start (to get rotation speed immediately)
-    if (SIMULATION_MODE)
-    {
-        gptimer_config_t timerConfig_hall;
-        timerConfig_hall.clk_src = GPTIMER_CLK_SRC_DEFAULT;
-        timerConfig_hall.direction = GPTIMER_COUNT_UP;
-        timerConfig_hall.resolution_hz = 1000000;
-        timerConfig_hall.intr_priority = 1;
-        ESP_ERROR_CHECK(gptimer_new_timer(&timerConfig_hall, &timerHandle_hall));
-
-        gptimer_alarm_config_t timerAlarm_hall;
-        timerAlarm_hall.alarm_count = 1000000; // TODO: set start count to right value
-        timerAlarm_hall.reload_count = 0;
-        timerAlarm_hall.flags.auto_reload_on_alarm = true;
-        ESP_ERROR_CHECK(gptimer_set_alarm_action(timerHandle_hall, &timerAlarm_hall));
-
-        gptimer_event_callbacks_t timerCb_hall;
-        timerCb_hall.on_alarm = isr_hall_simulation;
-        ESP_ERROR_CHECK(gptimer_register_event_callbacks(timerHandle_hall, &timerCb_hall, NULL));
-        ESP_ERROR_CHECK(gptimer_enable(timerHandle_hall));
-        ESP_ERROR_CHECK(gptimer_start(timerHandle_hall));
-    }
-    else
-    {
-        ESP_ERROR_CHECK(gpio_reset_pin(PIN_HALL));
-        ESP_ERROR_CHECK(gpio_set_direction(PIN_HALL, GPIO_MODE_INPUT));
-        ESP_ERROR_CHECK(gpio_pullup_en(PIN_HALL)); // TODO: Check if it helps
-        ESP_ERROR_CHECK(gpio_pulldown_dis(PIN_HALL));
-        ESP_ERROR_CHECK(gpio_set_intr_type(PIN_HALL, GPIO_INTR_NEGEDGE));
-        ESP_ERROR_CHECK(gpio_install_isr_service(0));
-        ESP_ERROR_CHECK(gpio_isr_handler_add(PIN_HALL, isr_hall, NULL));
-        ESP_ERROR_CHECK(gpio_intr_enable(PIN_HALL));
-    }
-
-    // leds_activate timer setup
-    gptimer_config_t timerConfig_leds_activate;
-    timerConfig_leds_activate.clk_src = GPTIMER_CLK_SRC_DEFAULT;
-    timerConfig_leds_activate.direction = GPTIMER_COUNT_UP;
-    timerConfig_leds_activate.resolution_hz = 1000000; // will be overwritten anyway
-    timerConfig_leds_activate.intr_priority = 1;
-    ESP_ERROR_CHECK(gptimer_new_timer(&timerConfig_leds_activate, &timerHandle_leds_activate));
-
-    gptimer_event_callbacks_t timerCb_leds_activate;
-    timerCb_leds_activate.on_alarm = isr_leds_activate;
-    ESP_ERROR_CHECK(gptimer_register_event_callbacks(timerHandle_leds_activate, &timerCb_leds_activate, NULL));
-    ESP_ERROR_CHECK(gptimer_enable(timerHandle_leds_activate));
-
-    // leds_deactivate timer setup
-    gptimer_config_t timerConfig_leds_deactivate;
-    timerConfig_leds_deactivate.clk_src = GPTIMER_CLK_SRC_DEFAULT;
-    timerConfig_leds_deactivate.direction = GPTIMER_COUNT_UP;
-    timerConfig_leds_deactivate.resolution_hz = 1000000; // will be overwritten anyway  TODO: deactivation time calculation
-    timerConfig_leds_deactivate.intr_priority = 1;
-    ESP_ERROR_CHECK(gptimer_new_timer(&timerConfig_leds_deactivate, &timerHandle_leds_deactivate));
-
-    gptimer_event_callbacks_t timerCb_leds_deactivate;
-    timerCb_leds_deactivate.on_alarm = isr_leds_deactivate;
-    ESP_ERROR_CHECK(gptimer_register_event_callbacks(timerHandle_leds_deactivate, &timerCb_leds_deactivate, NULL));
-    ESP_ERROR_CHECK(gptimer_enable(timerHandle_leds_deactivate));
-
-    // wait for bldc startup to finish
-    vTaskSuspend(NULL); // TODO: IMPORTANT! change to mutex or semaphore?
-    gptimer_del_timer(timerHandle_bldc);
-    timerHandle_bldc = NULL;
-
-    gptimer_alarm_config_t timerAlarm_leds_activate;
-    while (true)
-    {
-        vTaskSuspend(NULL);
-        t_calculation_error_start = esp_timer_get_time();
-        t_hall_delta = t_hall_new - t_hall_old;
-        t_chamber_delta = 5 * t_hall_delta;  // float vermeidung *10
-        t_chamber_start = 48 * t_hall_delta; // float vermeidung *10
-        calculateAbsoluteChamberTimes();
-        calculateRelativeTimeslots();
-        timeslot_ptr = &timeslots[0];
-        timerAlarm_leds_activate.reload_count = 0;
-        timerAlarm_leds_activate.flags.auto_reload_on_alarm = false;
-        t_calculation_error = esp_timer_get_time() - t_calculation_error_start;
-        timerAlarm_leds_activate.alarm_count = timeslot_ptr->time - t_calculation_error;
-        ESP_ERROR_CHECK(gptimer_set_alarm_action(timerHandle_leds_activate, &timerAlarm_leds_activate));
-        ESP_ERROR_CHECK(gptimer_start(timerHandle_leds_activate));
-        if (timerAlarm_leds_activate.alarm_count <= 0)
-        {
-            ESP_LOGE(LOG_TAG, "LED calculation takes too long. alarm_count = %d", timerAlarm_leds_activate.alarm_count);
-        }
-    }
-}
+void calculateAbsoluteChamberTimes();
+void calculateRelativeTimeslots();
+void fitStringSize(std::string &input);
+void updateSymbols(std::string &symbols);
+void toggleMode();
 
 // ISRs
 static bool IRAM_ATTR isr_bldc_startup(gptimer_handle_t timer, const gptimer_alarm_event_data_t *edata, void *user_ctx)
 {
+    gptimer_alarm_config_t timerAlarm_bldc;
     switch (t_bldc_delay)
     {
     case 20:
-        gptimer_alarm_config_t timerAlarm_bldc;
         timerAlarm_bldc.alarm_count = 1000000; // TODO: set start count to right value
         timerAlarm_bldc.reload_count = 0;
         timerAlarm_bldc.flags.auto_reload_on_alarm = true;
         ESP_ERROR_CHECK(gptimer_set_alarm_action(timerHandle_bldc, &timerAlarm_bldc));
         break;
     case 10:
-        gptimer_alarm_config_t timerAlarm_bldc;
         timerAlarm_bldc.alarm_count = 1000000; // TODO: set start count to right value
         timerAlarm_bldc.reload_count = 0;
         timerAlarm_bldc.flags.auto_reload_on_alarm = true;
@@ -246,7 +97,7 @@ static bool IRAM_ATTR isr_bldc_startup(gptimer_handle_t timer, const gptimer_ala
         xTaskResumeFromISR(taskHandle_leds);
         break;
     }
-    t_bldc_delay--;
+    t_bldc_delay = t_bldc_delay - 1;
     return true;
 }
 
@@ -391,14 +242,155 @@ void updateSymbols(std::string &symbols)
 
 void toggleMode()
 {
-    show_time != show_time;
+    show_time = !show_time;
 }
 
-inline void delay(int64_t delay_us)
+// MAIN
+void task_bldc(void *pvParameters)
 {
-    int64_t t_start = esp_timer_get_time();
-    while (esp_timer_get_time() - t_start <= delay_us)
+
+    bldc.begin(BLDC_MOTOR_POLE, BLDC_DRV_IN1, BLDC_DRV_IN2, BLDC_DRV_IN3, BLDC_DRV_EN1, BLDC_DRV_EN2, BLDC_DRV_EN3);
+    bldc.SetPower(100);
+
+    gptimer_config_t timerConfig_bldc;
+    timerConfig_bldc.clk_src = GPTIMER_CLK_SRC_DEFAULT;
+    timerConfig_bldc.direction = GPTIMER_COUNT_UP;
+    timerConfig_bldc.resolution_hz = 1000000;
+    timerConfig_bldc.intr_priority = 1;
+    ESP_ERROR_CHECK(gptimer_new_timer(&timerConfig_bldc, &timerHandle_bldc));
+
+    gptimer_alarm_config_t timerAlarm_bldc;
+    timerAlarm_bldc.alarm_count = 1000000; // TODO: set start count to right value
+    timerAlarm_bldc.reload_count = 0;
+    timerAlarm_bldc.flags.auto_reload_on_alarm = true;
+    ESP_ERROR_CHECK(gptimer_set_alarm_action(timerHandle_bldc, &timerAlarm_bldc));
+
+    gptimer_event_callbacks_t timerCb_bldc;
+    timerCb_bldc.on_alarm = isr_bldc_startup;
+    ESP_ERROR_CHECK(gptimer_register_event_callbacks(timerHandle_bldc, &timerCb_bldc, NULL));
+
+    ESP_ERROR_CHECK(gptimer_enable(timerHandle_bldc));
+    ESP_ERROR_CHECK(gptimer_start(timerHandle_bldc));
+
+    while (true)
     {
-        __asm__ __volatile__("" ::: "memory"); // verhindert "wegoptimieren" der schleife durch compiler
+        bldc.DoRotate();
+        delayMicroseconds(t_bldc_delay);
+    }
+}
+
+void task_leds(void *pvParameters)
+{
+    // initialise chambers
+    for (int pin : led_pins)
+    {
+        ESP_ERROR_CHECK(gpio_set_direction(static_cast<gpio_num_t>(pin), GPIO_MODE_OUTPUT));
+        Chamber chamber = {
+            .pin = (gpio_num_t)pin,
+            .symbol = symbols[0],
+            .time = 0,
+        };
+        chambers.push_back(chamber);
+    }
+
+    // hall interrupt setup and start (to get rotation speed immediately)
+    if (SIMULATION_MODE)
+    {
+        gptimer_config_t timerConfig_hall;
+        timerConfig_hall.clk_src = GPTIMER_CLK_SRC_DEFAULT;
+        timerConfig_hall.direction = GPTIMER_COUNT_UP;
+        timerConfig_hall.resolution_hz = 1000000;
+        timerConfig_hall.intr_priority = 1;
+        ESP_ERROR_CHECK(gptimer_new_timer(&timerConfig_hall, &timerHandle_hall));
+
+        gptimer_alarm_config_t timerAlarm_hall;
+        timerAlarm_hall.alarm_count = 1000000; // TODO: set start count to right value
+        timerAlarm_hall.reload_count = 0;
+        timerAlarm_hall.flags.auto_reload_on_alarm = true;
+        ESP_ERROR_CHECK(gptimer_set_alarm_action(timerHandle_hall, &timerAlarm_hall));
+
+        gptimer_event_callbacks_t timerCb_hall;
+        timerCb_hall.on_alarm = isr_hall_simulation;
+        ESP_ERROR_CHECK(gptimer_register_event_callbacks(timerHandle_hall, &timerCb_hall, NULL));
+        ESP_ERROR_CHECK(gptimer_enable(timerHandle_hall));
+        ESP_ERROR_CHECK(gptimer_start(timerHandle_hall));
+    }
+    else
+    {
+        ESP_ERROR_CHECK(gpio_reset_pin(PIN_HALL));
+        ESP_ERROR_CHECK(gpio_set_direction(PIN_HALL, GPIO_MODE_INPUT));
+        ESP_ERROR_CHECK(gpio_pullup_en(PIN_HALL)); // TODO: Check if it helps
+        ESP_ERROR_CHECK(gpio_pulldown_dis(PIN_HALL));
+        ESP_ERROR_CHECK(gpio_set_intr_type(PIN_HALL, GPIO_INTR_NEGEDGE));
+        ESP_ERROR_CHECK(gpio_install_isr_service(0));
+        ESP_ERROR_CHECK(gpio_isr_handler_add(PIN_HALL, isr_hall, NULL));
+        ESP_ERROR_CHECK(gpio_intr_enable(PIN_HALL));
+    }
+
+    // leds_activate timer setup
+    gptimer_config_t timerConfig_leds_activate;
+    timerConfig_leds_activate.clk_src = GPTIMER_CLK_SRC_DEFAULT;
+    timerConfig_leds_activate.direction = GPTIMER_COUNT_UP;
+    timerConfig_leds_activate.resolution_hz = 1000000; // will be overwritten anyway
+    timerConfig_leds_activate.intr_priority = 1;
+    ESP_ERROR_CHECK(gptimer_new_timer(&timerConfig_leds_activate, &timerHandle_leds_activate));
+
+    gptimer_event_callbacks_t timerCb_leds_activate;
+    timerCb_leds_activate.on_alarm = isr_leds_activate;
+    ESP_ERROR_CHECK(gptimer_register_event_callbacks(timerHandle_leds_activate, &timerCb_leds_activate, NULL));
+    ESP_ERROR_CHECK(gptimer_enable(timerHandle_leds_activate));
+
+    // leds_deactivate timer setup
+    gptimer_config_t timerConfig_leds_deactivate;
+    timerConfig_leds_deactivate.clk_src = GPTIMER_CLK_SRC_DEFAULT;
+    timerConfig_leds_deactivate.direction = GPTIMER_COUNT_UP;
+    timerConfig_leds_deactivate.resolution_hz = 1000000; // will be overwritten anyway  TODO: deactivation time calculation
+    timerConfig_leds_deactivate.intr_priority = 1;
+    ESP_ERROR_CHECK(gptimer_new_timer(&timerConfig_leds_deactivate, &timerHandle_leds_deactivate));
+
+    gptimer_event_callbacks_t timerCb_leds_deactivate;
+    timerCb_leds_deactivate.on_alarm = isr_leds_deactivate;
+    ESP_ERROR_CHECK(gptimer_register_event_callbacks(timerHandle_leds_deactivate, &timerCb_leds_deactivate, NULL));
+    ESP_ERROR_CHECK(gptimer_enable(timerHandle_leds_deactivate));
+
+    // wait for bldc startup to finish
+    vTaskSuspend(NULL); // TODO: IMPORTANT! change to mutex or semaphore?
+    gptimer_del_timer(timerHandle_bldc);
+    timerHandle_bldc = NULL;
+
+    gptimer_alarm_config_t timerAlarm_leds_activate;
+    while (true)
+    {
+        vTaskSuspend(NULL);
+        t_calculation_error_start = esp_timer_get_time();
+        t_hall_delta = t_hall_new - t_hall_old;
+        t_chamber_delta = 5 * t_hall_delta;  // float vermeidung *10
+        t_chamber_start = 48 * t_hall_delta; // float vermeidung *10
+        calculateAbsoluteChamberTimes();
+        calculateRelativeTimeslots();
+        timeslot_ptr = &timeslots[0];
+        timerAlarm_leds_activate.reload_count = 0;
+        timerAlarm_leds_activate.flags.auto_reload_on_alarm = false;
+        t_calculation_error = esp_timer_get_time() - t_calculation_error_start;
+        timerAlarm_leds_activate.alarm_count = timeslot_ptr->time - t_calculation_error;
+        ESP_ERROR_CHECK(gptimer_set_alarm_action(timerHandle_leds_activate, &timerAlarm_leds_activate));
+        ESP_ERROR_CHECK(gptimer_start(timerHandle_leds_activate));
+        if (timerAlarm_leds_activate.alarm_count <= 0)
+        {
+            ESP_LOGE(LOG_TAG, "LED calculation takes too long. alarm_count = %llu", timerAlarm_leds_activate.alarm_count);
+        }
+    }
+}
+
+extern "C" void app_main(void)
+{
+    if (symbols.length() != led_pins.size())
+    {
+        ESP_LOGE(LOG_TAG, "num of symbols does not match num of led_gpios");
+    }
+    else
+    {
+        xTaskCreatePinnedToCore(task_leds, "Task LEDs", 4096, NULL, 1, &taskHandle_leds, 0);
+        xTaskCreatePinnedToCore(task_bldc, "Task BLDC", 4096, NULL, 1, &taskHandle_bldc, 1); // only task_bldc on core 1 allowed
     }
 }

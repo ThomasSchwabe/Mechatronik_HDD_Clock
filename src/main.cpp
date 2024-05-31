@@ -2,7 +2,9 @@
 
 #define LOG_LEVEL_LOCAL ESP_LOG_VERBOSE
 #include "esp_log.h"
-#define LOG_TAG "MAIN"
+#define TAG_MAIN "MAIN"
+#define TAG_BLDC "TASK BLDC"
+#define TAG_LEDS "TASK LEDS"
 
 #define RESOLUTION_MICROSECONDS 1000000
 
@@ -43,7 +45,7 @@ const uint8_t BLDC_DRV_EN2 = 12;
 const uint8_t BLDC_DRV_EN3 = 14;
 const uint8_t BLDC_MOTOR_POLE = 7;
 BLDC bldc;
-volatile unsigned long t_bldc_delay = 350;
+volatile uint32_t t_bldc_delay = 350;
 
 // Rotation time variables
 volatile int64_t t_hall_old = esp_timer_get_time();
@@ -59,7 +61,7 @@ int64_t t_placement_error = 0;
 
 // chamber variables
 const std::string symbols = "0123456789:.";
-const std::vector<int> led_pins = {15, 2, 4, 16, 17, 5, 18, 19, 21, 22};
+const std::vector<uint8_t> led_pins = {15, 2, 4, 16, 17, 5, 18, 19, 21, 22};
 std::vector<Chamber> chambers;
 std::vector<Timeslot> timeslots;
 Timeslot *timeslot_ptr;
@@ -67,18 +69,17 @@ int64_t t_calculation_error_start;
 int64_t t_calculation_error;
 
 // Mutex Handles
-SemaphoreHandle_t mutex_bldc;
-SemaphoreHandle_t mutex_leds;
+SemaphoreHandle_t semaphore_ledLoop = NULL;
 
 // Task Handles
 TaskHandle_t taskHandle_bldc = NULL;
 TaskHandle_t taskHandle_leds = NULL;
+TaskHandle_t taskHandle_cleanup = NULL;
 
 // Timer Handles
 gptimer_handle_t timerHandle_leds_activate = NULL;
 gptimer_handle_t timerHandle_leds_deactivate = NULL;
 gptimer_handle_t timerHandle_bldc = NULL;
-gptimer_handle_t timerHandle_hall = NULL;
 
 // Task Functions
 void task_bldc(void *pvParameters);
@@ -92,10 +93,28 @@ void updateSymbols(std::string &symbols);
 void toggleMode();
 
 // ISRs
+static bool IRAM_ATTR isr_decrease_power(gptimer_handle_t timer, const gptimer_alarm_event_data_t *edata, void *user_ctx)
+{
+    BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+
+    bldc.SetPower(80);
+    ESP_ERROR_CHECK(gptimer_disable(timerHandle_bldc));
+    xTaskResumeFromISR(taskHandle_cleanup);
+
+    if (xHigherPriorityTaskWoken == pdTRUE) // Prüfe, ob ein höher priorisierter Task geweckt wurde
+    {
+        portYIELD_FROM_ISR(xHigherPriorityTaskWoken); // Erzwinge einen Kontextwechsel
+    }
+
+    return (xHigherPriorityTaskWoken == pdTRUE);
+}
+
 static bool IRAM_ATTR isr_bldc_startup(gptimer_handle_t timer, const gptimer_alarm_event_data_t *edata, void *user_ctx)
 {
-    t_bldc_delay -= 1;
+    BaseType_t xHigherPriorityTaskWoken = pdFALSE;
     gptimer_alarm_config_t timerAlarm_bldc;
+
+    t_bldc_delay -= 1;
     switch (t_bldc_delay)
     {
     case 29:
@@ -111,30 +130,39 @@ static bool IRAM_ATTR isr_bldc_startup(gptimer_handle_t timer, const gptimer_ala
         ESP_ERROR_CHECK(gptimer_set_alarm_action(timerHandle_bldc, &timerAlarm_bldc));
         break;
     case 6:
-        gptimer_disable(timerHandle_bldc);
+        // change isr to decrease power
+        ESP_ERROR_CHECK(gptimer_disable(timerHandle_bldc));
         xTaskResumeFromISR(taskHandle_leds);
         break;
     }
-    return true;
-}
 
-static bool IRAM_ATTR isr_hall_simulation(gptimer_handle_t timer, const gptimer_alarm_event_data_t *edata, void *user_ctx)
-{
-    t_hall_old = t_hall_new;
-    t_hall_new = esp_timer_get_time();
-    xTaskResumeFromISR(taskHandle_leds);
-    return true;
+    if (xHigherPriorityTaskWoken == pdTRUE) // Prüfe, ob ein höher priorisierter Task geweckt wurde
+    {
+        portYIELD_FROM_ISR(xHigherPriorityTaskWoken); // Erzwinge einen Kontextwechsel
+    }
+
+    return (xHigherPriorityTaskWoken == pdTRUE);
 }
 
 static void IRAM_ATTR isr_hall(void *arg)
 {
+    BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+
     t_hall_old = t_hall_new;
     t_hall_new = esp_timer_get_time();
-    xTaskResumeFromISR(taskHandle_leds);
+
+    xSemaphoreGiveFromISR(semaphore_ledLoop, &xHigherPriorityTaskWoken);
+
+    if (xHigherPriorityTaskWoken == pdTRUE) // Prüfe, ob ein höher priorisierter Task geweckt wurde
+    {
+        portYIELD_FROM_ISR(xHigherPriorityTaskWoken); // Erzwinge einen Kontextwechsel
+    }
 }
 
 static bool IRAM_ATTR isr_leds_activate(gptimer_handle_t timer, const gptimer_alarm_event_data_t *edata, void *user_ctx)
 {
+    BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+
     for (gpio_num_t pin : timeslot_ptr->pins)
     {
         gpio_set_level(pin, 1);
@@ -145,11 +173,19 @@ static bool IRAM_ATTR isr_leds_activate(gptimer_handle_t timer, const gptimer_al
     alarmConfig.flags.auto_reload_on_alarm = false;
     ESP_ERROR_CHECK(gptimer_set_alarm_action(timerHandle_leds_deactivate, &alarmConfig));
     ESP_ERROR_CHECK(gptimer_start(timerHandle_leds_deactivate));
-    return true;
+
+    if (xHigherPriorityTaskWoken == pdTRUE) // Prüfe, ob ein höher priorisierter Task geweckt wurde
+    {
+        portYIELD_FROM_ISR(xHigherPriorityTaskWoken); // Erzwinge einen Kontextwechsel
+    }
+
+    return (xHigherPriorityTaskWoken == pdTRUE);
 }
 
 static bool IRAM_ATTR isr_leds_deactivate(gptimer_handle_t timer, const gptimer_alarm_event_data_t *edata, void *user_ctx)
 {
+    BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+
     for (gpio_num_t pin : timeslot_ptr->pins)
     {
         gpio_set_level(pin, 0);
@@ -166,7 +202,13 @@ static bool IRAM_ATTR isr_leds_deactivate(gptimer_handle_t timer, const gptimer_
         ESP_ERROR_CHECK(gptimer_set_alarm_action(timerHandle_leds_activate, &alarmConfig));
         ESP_ERROR_CHECK(gptimer_start(timerHandle_leds_deactivate));
     }
-    return true;
+
+    if (xHigherPriorityTaskWoken == pdTRUE) // Prüfe, ob ein höher priorisierter Task geweckt wurde
+    {
+        portYIELD_FROM_ISR(xHigherPriorityTaskWoken); // Erzwinge einen Kontextwechsel
+    }
+
+    return (xHigherPriorityTaskWoken == pdTRUE);
 }
 
 // Functions
@@ -270,7 +312,6 @@ double calculateTimeFactor(uint16_t angle_deg)
 // MAIN
 void task_bldc(void *pvParameters)
 {
-
     bldc.begin(BLDC_MOTOR_POLE, BLDC_DRV_IN1, BLDC_DRV_IN2, BLDC_DRV_IN3, BLDC_DRV_EN1, BLDC_DRV_EN2, BLDC_DRV_EN3);
     bldc.SetPower(100);
 
@@ -304,9 +345,9 @@ void task_bldc(void *pvParameters)
 void task_leds(void *pvParameters)
 {
     // initialise chambers
-    for (int pin : led_pins)
+    for (uint8_t pin : led_pins)
     {
-        ESP_ERROR_CHECK(gpio_set_direction(static_cast<gpio_num_t>(pin), GPIO_MODE_OUTPUT));
+        ESP_ERROR_CHECK(gpio_set_direction((gpio_num_t)pin, GPIO_MODE_OUTPUT));
         Chamber chamber = {
             .pin = (gpio_num_t)pin,
             .symbol = symbols[0],
@@ -316,38 +357,14 @@ void task_leds(void *pvParameters)
     }
 
     // hall interrupt setup and start (to get rotation speed immediately)
-    if (SIMULATION_MODE)
-    {
-        gptimer_config_t timerConfig_hall;
-        timerConfig_hall.clk_src = GPTIMER_CLK_SRC_DEFAULT;
-        timerConfig_hall.direction = GPTIMER_COUNT_UP;
-        timerConfig_hall.resolution_hz = 60;
-        timerConfig_hall.intr_priority = 1;
-        ESP_ERROR_CHECK(gptimer_new_timer(&timerConfig_hall, &timerHandle_hall));
-
-        gptimer_alarm_config_t timerAlarm_hall;
-        timerAlarm_hall.alarm_count = 1;
-        timerAlarm_hall.reload_count = 0;
-        timerAlarm_hall.flags.auto_reload_on_alarm = true;
-        ESP_ERROR_CHECK(gptimer_set_alarm_action(timerHandle_hall, &timerAlarm_hall));
-
-        gptimer_event_callbacks_t timerCb_hall;
-        timerCb_hall.on_alarm = isr_hall_simulation;
-        ESP_ERROR_CHECK(gptimer_register_event_callbacks(timerHandle_hall, &timerCb_hall, NULL));
-        ESP_ERROR_CHECK(gptimer_enable(timerHandle_hall));
-        ESP_ERROR_CHECK(gptimer_start(timerHandle_hall));
-    }
-    else
-    {
-        ESP_ERROR_CHECK(gpio_reset_pin(PIN_HALL));
-        ESP_ERROR_CHECK(gpio_set_direction(PIN_HALL, GPIO_MODE_INPUT));
-        // ESP_ERROR_CHECK(gpio_pullup_en(PIN_HALL)); // TODO: Check if it helps
-        ESP_ERROR_CHECK(gpio_pulldown_dis(PIN_HALL));
-        ESP_ERROR_CHECK(gpio_set_intr_type(PIN_HALL, GPIO_INTR_NEGEDGE));
-        ESP_ERROR_CHECK(gpio_install_isr_service(0));
-        ESP_ERROR_CHECK(gpio_isr_handler_add(PIN_HALL, isr_hall, NULL));
-        ESP_ERROR_CHECK(gpio_intr_enable(PIN_HALL));
-    }
+    ESP_ERROR_CHECK(gpio_reset_pin(PIN_HALL));
+    ESP_ERROR_CHECK(gpio_set_direction(PIN_HALL, GPIO_MODE_INPUT));
+    // TODO: Check if it helps      ESP_ERROR_CHECK(gpio_pullup_en(PIN_HALL));
+    ESP_ERROR_CHECK(gpio_pulldown_dis(PIN_HALL));
+    ESP_ERROR_CHECK(gpio_set_intr_type(PIN_HALL, GPIO_INTR_NEGEDGE));
+    ESP_ERROR_CHECK(gpio_install_isr_service(0));
+    ESP_ERROR_CHECK(gpio_isr_handler_add(PIN_HALL, isr_hall, NULL));
+    ESP_ERROR_CHECK(gpio_intr_enable(PIN_HALL));
 
     // leds_activate timer setup
     gptimer_config_t timerConfig_leds_activate;
@@ -376,14 +393,24 @@ void task_leds(void *pvParameters)
     ESP_ERROR_CHECK(gptimer_enable(timerHandle_leds_deactivate));
 
     // wait for bldc startup to finish
-    vTaskSuspend(NULL); // TODO: IMPORTANT! change to mutex or semaphore?
-    gptimer_del_timer(timerHandle_bldc);
-    timerHandle_bldc = NULL;
+    vTaskSuspend(NULL);
 
+    // start bldc power decrease timer
+    gptimer_event_callbacks_t timerCB;
+    timerCB.on_alarm = isr_decrease_power;
+    ESP_ERROR_CHECK(gptimer_register_event_callbacks(timerHandle_bldc, &timerCB, NULL));
+    ESP_ERROR_CHECK(gptimer_enable(timerHandle_bldc));
+    ESP_ERROR_CHECK(gptimer_start(timerHandle_bldc));
+
+    // LEDs mainloop
     gptimer_alarm_config_t timerAlarm_leds_activate;
     while (true)
     {
-        vTaskSuspend(NULL);
+        if (xSemaphoreTake(semaphore_ledLoop, portMAX_DELAY) == pdFALSE)
+        {
+            ESP_LOGE(TAG_LEDS, "semaphore_ledLoop could not be obtained!");
+            continue;
+        }
         t_calculation_error_start = esp_timer_get_time();
         t_hall_delta = t_hall_new - t_hall_old;
         t_chamber_delta = (int64_t)(t_chamber_delta_faktor * (double)t_hall_delta);
@@ -400,9 +427,17 @@ void task_leds(void *pvParameters)
         ESP_ERROR_CHECK(gptimer_start(timerHandle_leds_activate));
         if (timerAlarm_leds_activate.alarm_count <= 0)
         {
-            ESP_LOGE(LOG_TAG, "LED calculation takes too long. alarm_count = %llu", timerAlarm_leds_activate.alarm_count);
+            ESP_LOGE(LOG_TAG, "LED calculation takes too long! alarm_count = %llu", timerAlarm_leds_activate.alarm_count);
         }
     }
+}
+
+void task_cleanup(void *pvParameters)
+{
+    ESP_ERROR_CHECK(gptimer_stop(timerHandle_bldc));
+    ESP_ERROR_CHECK(gptimer_del_timer(timerHandle_bldc));
+    timerHandle_bldc = NULL;
+    ESP_LOGI(TAG_MAIN, "Successfully removed unnecessary stuff after startup");
 }
 
 extern "C" void app_main(void)
@@ -410,13 +445,21 @@ extern "C" void app_main(void)
     if (symbols.length() != led_pins.size())
     {
         ESP_LOGE(LOG_TAG, "num of symbols does not match num of led_gpios");
+        return;
     }
-    else
+
+    semaphore_ledLoop = xSemaphoreCreateBinary();
+    if (semaphore_ledLoop == NULL)
     {
-        t_chamber_delta_faktor = calculateTimeFactor(18);
-        t_chamber_start_faktor = calculateTimeFactor(162);
-        t_led_on_faktor = calculateTimeFactor(8);
-        xTaskCreatePinnedToCore(task_leds, "Task LEDs", 4096, NULL, 1, &taskHandle_leds, 0);
-        xTaskCreatePinnedToCore(task_bldc, "Task BLDC", 4096, NULL, 1, &taskHandle_bldc, 1); // only task_bldc on core 1 allowed
+        ESP_LOGE(LOG_TAG, "Failed to create semaphore_ledLoop");
     }
+
+    t_chamber_delta_faktor = calculateTimeFactor(18);
+    t_chamber_start_faktor = calculateTimeFactor(162);
+    t_led_on_faktor = calculateTimeFactor(8);
+    xTaskCreatePinnedToCore(task_bldc, "Task BLDC", 4096, NULL, 2, &taskHandle_bldc, 1); // only task_bldc on core 1 allowed
+    xTaskCreatePinnedToCore(task_leds, "Task LEDs", 4096, NULL, 2, &taskHandle_leds, 0);
+    xTaskCreatePinnedToCore(task_cleanup, "Task Cleanup", 1024, NULL, 1, &taskHandle_cleanup, 0);
+    vTaskSuspend(taskHandle_cleanup);
+    vTaskSuspend(taskHandle_leds);
 }

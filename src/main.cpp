@@ -44,8 +44,10 @@ const uint8_t BLDC_DRV_EN1 = 13;
 const uint8_t BLDC_DRV_EN2 = 12;
 const uint8_t BLDC_DRV_EN3 = 14;
 const uint8_t BLDC_MOTOR_POLE = 7;
-BLDC bldc;
-volatile uint32_t t_bldc_delay = 350;
+UcnBrushlessDCMotorPWM bldc;
+volatile uint32_t t_bldc_delay = 1500;
+uint32_t startValue_bldc = 30;
+double exponent = 0.0;
 
 // Rotation time variables
 volatile int64_t t_hall_old = esp_timer_get_time();
@@ -111,37 +113,22 @@ static bool IRAM_ATTR isr_decrease_power(gptimer_handle_t timer, const gptimer_a
 
 static bool IRAM_ATTR isr_bldc_startup(gptimer_handle_t timer, const gptimer_alarm_event_data_t *edata, void *user_ctx)
 {
-    BaseType_t xHigherPriorityTaskWoken = pdFALSE;
     gptimer_alarm_config_t timerAlarm_bldc;
 
-    t_bldc_delay -= 1;
-    switch (t_bldc_delay)
+    if (t_bldc_delay > 55) // 69 -> 60Hz, 55 -> 72Hz, 42 -> 90Hz
     {
-    case 29:
-        timerAlarm_bldc.alarm_count = 500000;
-        timerAlarm_bldc.reload_count = 0;
-        timerAlarm_bldc.flags.auto_reload_on_alarm = true;
-        ESP_ERROR_CHECK(gptimer_set_alarm_action(timerHandle_bldc, &timerAlarm_bldc));
-        break;
-    case 9:
-        timerAlarm_bldc.alarm_count = 4500000;
-        timerAlarm_bldc.reload_count = 0;
-        timerAlarm_bldc.flags.auto_reload_on_alarm = true;
-        ESP_ERROR_CHECK(gptimer_set_alarm_action(timerHandle_bldc, &timerAlarm_bldc));
-        break;
-    case 6:
-        // change isr to decrease power
-        ESP_ERROR_CHECK(gptimer_disable(timerHandle_bldc));
+        t_bldc_delay -= 1;
+    }
+    else
+    {
         xTaskResumeFromISR(taskHandle_leds);
-        break;
     }
-
-    if (xHigherPriorityTaskWoken == pdTRUE) // Prüfe, ob ein höher priorisierter Task geweckt wurde
-    {
-        portYIELD_FROM_ISR(xHigherPriorityTaskWoken); // Erzwinge einen Kontextwechsel
-    }
-
-    return (xHigherPriorityTaskWoken == pdTRUE);
+    timerAlarm_bldc.alarm_count = exp(exponent) * startValue_bldc;
+    timerAlarm_bldc.reload_count = 0;
+    timerAlarm_bldc.flags.auto_reload_on_alarm = true;
+    ESP_ERROR_CHECK(gptimer_set_alarm_action(timerHandle_bldc, &timerAlarm_bldc));
+    exponent += 0.00495;
+    return true;
 }
 
 static void IRAM_ATTR isr_hall(void *arg)
@@ -171,6 +158,10 @@ static bool IRAM_ATTR isr_leds_activate(gptimer_handle_t timer, const gptimer_al
     gptimer_alarm_config_t alarmConfig;
     alarmConfig.alarm_count = t_led_on;
     alarmConfig.flags.auto_reload_on_alarm = false;
+    if (!first_activation)
+    {
+        ESP_ERROR_CHECK(gptimer_stop(timerHandle_leds_deactivate));
+    }
     ESP_ERROR_CHECK(gptimer_set_alarm_action(timerHandle_leds_deactivate, &alarmConfig));
     ESP_ERROR_CHECK(gptimer_start(timerHandle_leds_deactivate));
 
@@ -199,6 +190,7 @@ static bool IRAM_ATTR isr_leds_deactivate(gptimer_handle_t timer, const gptimer_
         gptimer_alarm_config_t alarmConfig;
         alarmConfig.alarm_count = timeslot_ptr->time;
         alarmConfig.flags.auto_reload_on_alarm = false;
+        ESP_ERROR_CHECK(gptimer_stop(timerHandle_leds_deactivate));
         ESP_ERROR_CHECK(gptimer_set_alarm_action(timerHandle_leds_activate, &alarmConfig));
         ESP_ERROR_CHECK(gptimer_start(timerHandle_leds_deactivate));
     }
@@ -292,7 +284,7 @@ void updateSymbols(std::string &symbols)
     {
         if (symbols_iter == symbols.end())
         {
-            ESP_LOGE(LOG_TAG, "Couldn't update symbols properly.");
+            ESP_LOGE(TAG_MAIN, "Couldn't update symbols properly.");
             break;
         }
         chamber.symbol = *symbols_iter;
@@ -323,7 +315,7 @@ void task_bldc(void *pvParameters)
     ESP_ERROR_CHECK(gptimer_new_timer(&timerConfig_bldc, &timerHandle_bldc));
 
     gptimer_alarm_config_t timerAlarm_bldc;
-    timerAlarm_bldc.alarm_count = 5000;
+    timerAlarm_bldc.alarm_count = startValue_bldc;
     timerAlarm_bldc.reload_count = 0;
     timerAlarm_bldc.flags.auto_reload_on_alarm = true;
     ESP_ERROR_CHECK(gptimer_set_alarm_action(timerHandle_bldc, &timerAlarm_bldc));
@@ -337,17 +329,56 @@ void task_bldc(void *pvParameters)
 
     while (true)
     {
-        bldc.DoRotate();
+        bldc.DoRotate(4);
         delayMicroseconds(t_bldc_delay);
+    }
+}
+
+void task_measureSpeed(void *pvParametesr)
+{
+    t_hall_old = esp_timer_get_time();
+    t_hall_new = esp_timer_get_time();
+
+    ESP_ERROR_CHECK(gpio_reset_pin(PIN_HALL));
+    ESP_ERROR_CHECK(gpio_set_direction(PIN_HALL, GPIO_MODE_INPUT));
+    // TODO: Check if it helps      ESP_ERROR_CHECK(gpio_pullup_en(PIN_HALL));
+    ESP_ERROR_CHECK(gpio_pulldown_dis(PIN_HALL));
+    ESP_ERROR_CHECK(gpio_set_intr_type(PIN_HALL, GPIO_INTR_NEGEDGE));
+    ESP_ERROR_CHECK(gpio_install_isr_service(0));
+    ESP_ERROR_CHECK(gpio_isr_handler_add(PIN_HALL, isr_hall, NULL));
+    ESP_ERROR_CHECK(gpio_intr_enable(PIN_HALL));
+
+    double speed = 0;
+    while (true)
+    {
+        if (xSemaphoreTake(semaphore_ledLoop, portMAX_DELAY) == pdFALSE)
+        {
+            ESP_LOGE(TAG_LEDS, "semaphore_ledLoop could not be obtained!");
+            continue;
+        }
+        speed = 1000000.0 / (double)(t_hall_new - t_hall_old);
+        printf("\e[2J\e[H");
+        ESP_LOGI(TAG_BLDC, "speed=%f", speed);
     }
 }
 
 void task_leds(void *pvParameters)
 {
     // initialise chambers
+    gpio_config_t conf;
     for (uint8_t pin : led_pins)
     {
-        ESP_ERROR_CHECK(gpio_set_direction((gpio_num_t)pin, GPIO_MODE_OUTPUT));
+        conf = {
+            .pin_bit_mask = (1ULL << pin),
+            .mode = GPIO_MODE_OUTPUT,
+            .pull_up_en = GPIO_PULLUP_DISABLE,
+            .pull_down_en = GPIO_PULLDOWN_DISABLE,
+            .intr_type = GPIO_INTR_DISABLE};
+        if (gpio_config(&conf) != ESP_OK)
+        {
+            ESP_LOGE(TAG_ACL, "GPIO config failed");
+            return;
+        }
         Chamber chamber = {
             .pin = (gpio_num_t)pin,
             .symbol = symbols[0],
@@ -395,12 +426,10 @@ void task_leds(void *pvParameters)
     // wait for bldc startup to finish
     vTaskSuspend(NULL);
 
-    // start bldc power decrease timer
-    gptimer_event_callbacks_t timerCB;
-    timerCB.on_alarm = isr_decrease_power;
-    ESP_ERROR_CHECK(gptimer_register_event_callbacks(timerHandle_bldc, &timerCB, NULL));
-    ESP_ERROR_CHECK(gptimer_enable(timerHandle_bldc));
-    ESP_ERROR_CHECK(gptimer_start(timerHandle_bldc));
+    ESP_ERROR_CHECK(gptimer_stop(timerHandle_bldc));
+    ESP_ERROR_CHECK(gptimer_disable(timerHandle_bldc));
+    ESP_ERROR_CHECK(gptimer_del_timer(timerHandle_bldc));
+    timerHandle_bldc = NULL;
 
     // LEDs mainloop
     gptimer_alarm_config_t timerAlarm_leds_activate;
@@ -427,39 +456,32 @@ void task_leds(void *pvParameters)
         ESP_ERROR_CHECK(gptimer_start(timerHandle_leds_activate));
         if (timerAlarm_leds_activate.alarm_count <= 0)
         {
-            ESP_LOGE(LOG_TAG, "LED calculation takes too long! alarm_count = %llu", timerAlarm_leds_activate.alarm_count);
+            ESP_LOGE(TAG_MAIN, "LED calculation takes too long! alarm_count = %llu", timerAlarm_leds_activate.alarm_count);
         }
     }
 }
 
-void task_cleanup(void *pvParameters)
-{
-    ESP_ERROR_CHECK(gptimer_stop(timerHandle_bldc));
-    ESP_ERROR_CHECK(gptimer_del_timer(timerHandle_bldc));
-    timerHandle_bldc = NULL;
-    ESP_LOGI(TAG_MAIN, "Successfully removed unnecessary stuff after startup");
-}
-
 extern "C" void app_main(void)
 {
-    if (symbols.length() != led_pins.size())
-    {
-        ESP_LOGE(LOG_TAG, "num of symbols does not match num of led_gpios");
-        return;
-    }
+    // if (symbols.length() != led_pins.size())
+    //{
+    //     ESP_LOGE(LOG_TAG, "num of symbols does not match num of led_gpios");
+    //     ESP_LOGE(LOG_TAG, "symbols.length()=%d, led_pins.size()=%d", symbols.length(), led_pins.size());
+    //     return;
+    // }
 
     semaphore_ledLoop = xSemaphoreCreateBinary();
     if (semaphore_ledLoop == NULL)
     {
-        ESP_LOGE(LOG_TAG, "Failed to create semaphore_ledLoop");
+        ESP_LOGE(TAG_MAIN, "Failed to create semaphore_ledLoop");
     }
 
     t_chamber_delta_faktor = calculateTimeFactor(18);
     t_chamber_start_faktor = calculateTimeFactor(162);
     t_led_on_faktor = calculateTimeFactor(8);
-    xTaskCreatePinnedToCore(task_bldc, "Task BLDC", 4096, NULL, 2, &taskHandle_bldc, 1); // only task_bldc on core 1 allowed
+    xTaskCreatePinnedToCore(task_bldc, "Task BLDC", 6000, NULL, 2, &taskHandle_bldc, 1); // only task_bldc on core 1 allowed
+    // xTaskCreatePinnedToCore(task_measureSpeed, "Task Speed", 2048, NULL, 1, NULL, 0);
     xTaskCreatePinnedToCore(task_leds, "Task LEDs", 4096, NULL, 2, &taskHandle_leds, 0);
-    xTaskCreatePinnedToCore(task_cleanup, "Task Cleanup", 1024, NULL, 1, &taskHandle_cleanup, 0);
-    vTaskSuspend(taskHandle_cleanup);
-    vTaskSuspend(taskHandle_leds);
+    //  vTaskSuspend(taskHandle_cleanup);
+    //  vTaskSuspend(taskHandle_leds);
 }

@@ -11,6 +11,6 @@
 #include <algorithm>
 #include <math.h>
 
-#include "bldc.h"
+#include "UcnBrushlessDCMotorPWM.h"
 
-#define SIMULATION_MODE true
+#define SIMULATION_MODE false

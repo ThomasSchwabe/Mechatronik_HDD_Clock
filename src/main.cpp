@@ -125,7 +125,7 @@ static bool IRAM_ATTR isr_bldc_startup(gptimer_handle_t timer, const gptimer_ala
 {
     gptimer_alarm_config_t timerAlarm_bldc;
 
-    if (t_bldc_delay > 69) // 69 -> 60Hz, 55 -> 72Hz, 42 -> 90Hz
+    if (t_bldc_delay > 45) // 69 -> 60Hz, 55 -> 72Hz, stable max =
     {
         t_bldc_delay -= 1;
     }
@@ -159,7 +159,7 @@ static void IRAM_ATTR isr_hall(void *arg)
 static bool IRAM_ATTR isr_leds(gptimer_handle_t timer, const gptimer_alarm_event_data_t *edata, void *user_ctx)
 {
     ESP_ERROR_CHECK(gptimer_stop(timerHandle_leds));
-
+    t_calculation_error_start = esp_timer_get_time();
     gptimer_alarm_config_t alarmConfig;
     switch (leds_phase)
     {
@@ -170,12 +170,14 @@ static bool IRAM_ATTR isr_leds(gptimer_handle_t timer, const gptimer_alarm_event
             ESP_ERROR_CHECK(gpio_set_level(pin, 1));
         }
         // setup deactivation
-        alarmConfig.alarm_count = t_led_on;
         alarmConfig.reload_count = 0;
         alarmConfig.flags.auto_reload_on_alarm = true;
+        t_calculation_error = esp_timer_get_time() - t_calculation_error_start;
+        alarmConfig.alarm_count = t_led_on - t_calculation_error;
+
         ESP_ERROR_CHECK(gptimer_set_alarm_action(timerHandle_leds, &alarmConfig));
-        leds_phase = DEACTIVATION;
         ESP_ERROR_CHECK(gptimer_start(timerHandle_leds));
+        leds_phase = DEACTIVATION;
         break;
 
     case DEACTIVATION:
@@ -193,9 +195,10 @@ static bool IRAM_ATTR isr_leds(gptimer_handle_t timer, const gptimer_alarm_event
             timeslot_ptr = &timeslots.front();
 
             // setup activation timer
-            alarmConfig.alarm_count = timeslot_ptr->time;
             alarmConfig.reload_count = 0;
             alarmConfig.flags.auto_reload_on_alarm = true;
+            t_calculation_error = esp_timer_get_time() - t_calculation_error_start;
+            alarmConfig.alarm_count = timeslot_ptr->time - t_calculation_error;
             ESP_ERROR_CHECK(gptimer_set_alarm_action(timerHandle_leds, &alarmConfig));
             ESP_ERROR_CHECK(gptimer_start(timerHandle_leds));
         }
@@ -454,8 +457,6 @@ inline void printChamberTimes()
 void task_leds(void *pvParameters)
 {
     init_chambers();
-    std::string s = "0123456789";
-    updateSymbols(s);
     init_hallInterrupt(); // maybe place in bldc core
     init_timerLeds();
 
@@ -467,7 +468,6 @@ void task_leds(void *pvParameters)
 
     // LEDs mainloop
     gptimer_alarm_config_t timerAlarm_leds;
-    int64_t alarm_count;
     while (true)
     {
         // wait for hall interrupt
@@ -496,30 +496,11 @@ void task_leds(void *pvParameters)
         timerAlarm_leds.reload_count = 0;
         timerAlarm_leds.flags.auto_reload_on_alarm = true;
         t_calculation_error = esp_timer_get_time() - t_calculation_error_start;
-        alarm_count = timeslot_ptr->time - t_calculation_error;
-
-        // check for error
-        if (alarm_count <= 0)
-        {
-            ESP_LOGE(TAG_LEDS, "LEDs time calculation take too long or are wrong!");
-            ESP_LOGE(TAG_LEDS, "t_hall_delta=%lld", t_hall_delta);
-            ESP_LOGE(TAG_LEDS, "t_chamber_delta=%lld", t_chamber_delta);
-            ESP_LOGE(TAG_LEDS, "t_chamber_start=%lld", t_chamber_start);
-            ESP_LOGE(TAG_LEDS, "t_led_on=%lld", t_led_on);
-            ESP_LOGE(TAG_LEDS, "timeslot_ptr->time=%lu", timeslot_ptr->time);
-            ESP_LOGE(TAG_LEDS, "t_calculation_error=%lld", t_calculation_error);
-            ESP_LOGE(TAG_LEDS, "alarm_count=%lld", alarm_count);
-            ESP_LOGE(TAG_LEDS, "t_chamber_delta_faktor=%f", t_chamber_delta_faktor);
-            ESP_LOGE(TAG_LEDS, "t_chamber_start_faktor=%f", t_chamber_start_faktor);
-            ESP_LOGE(TAG_LEDS, "t_led_on_faktor=%f", t_led_on_faktor);
-            vTaskSuspend(NULL);
-        }
-
-        timerAlarm_leds.alarm_count = alarm_count;
+        timerAlarm_leds.alarm_count = timeslot_ptr->time - t_calculation_error;
 
         // start timer
         ESP_ERROR_CHECK(gptimer_set_alarm_action(timerHandle_leds, &timerAlarm_leds));
-        gptimer_start(timerHandle_leds); // ERROR
+        gptimer_start(timerHandle_leds);
     }
 }
 
@@ -538,8 +519,8 @@ extern "C" void app_main(void)
         ESP_LOGE(TAG_MAIN, "Failed to create semaphore_ledLoop");
     }
 
-    t_chamber_delta_faktor = calculateTimeFactor(17.4);
-    t_chamber_start_faktor = calculateTimeFactor(168.0);
+    t_chamber_delta_faktor = calculateTimeFactor(15.55);
+    t_chamber_start_faktor = calculateTimeFactor(177.8);
     t_led_on_faktor = calculateTimeFactor(2.0);
     xTaskCreatePinnedToCore(task_bldc, "Task BLDC", 6000, NULL, 2, &taskHandle_bldc, 1); // only task_bldc on core 1 allowed
     // xTaskCreatePinnedToCore(task_measureSpeed, "Task Speed", 2048, NULL, 1, NULL, 0);

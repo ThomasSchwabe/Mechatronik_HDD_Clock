@@ -5,6 +5,7 @@
 #include "driver/gpio.h"
 #include "esp_timer.h"
 #include "driver/gptimer.h"
+#include "driver/uart.h"
 
 #include <vector>
 #include <stdexcept>

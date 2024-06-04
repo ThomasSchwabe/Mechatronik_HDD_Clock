@@ -340,7 +340,7 @@ void task_bldc(void *pvParameters)
     }
 }
 
-void task_measureSpeed(void *pvParametesr)
+void task_measureSpeed(void *pvParameters)
 {
     t_hall_old = esp_timer_get_time();
     t_hall_new = esp_timer_get_time();
@@ -454,6 +454,8 @@ inline void printChamberTimes()
 void task_leds(void *pvParameters)
 {
     init_chambers();
+    std::string s = "0123456789";
+    updateSymbols(s);
     init_hallInterrupt(); // maybe place in bldc core
     init_timerLeds();
 
@@ -487,8 +489,8 @@ void task_leds(void *pvParameters)
 
         timeslot_ptr = &timeslots[0];
 
-        // DEBUG: printChamberTimes();
-        // DEBUG: printTimeslots();
+        // printChamberTimes();
+        // printTimeslots();
 
         // setup timer
         timerAlarm_leds.reload_count = 0;
@@ -536,9 +538,9 @@ extern "C" void app_main(void)
         ESP_LOGE(TAG_MAIN, "Failed to create semaphore_ledLoop");
     }
 
-    t_chamber_delta_faktor = calculateTimeFactor(18.0);
-    t_chamber_start_faktor = calculateTimeFactor(164.0);
-    t_led_on_faktor = calculateTimeFactor(1.0);
+    t_chamber_delta_faktor = calculateTimeFactor(17.4);
+    t_chamber_start_faktor = calculateTimeFactor(168.0);
+    t_led_on_faktor = calculateTimeFactor(2.0);
     xTaskCreatePinnedToCore(task_bldc, "Task BLDC", 6000, NULL, 2, &taskHandle_bldc, 1); // only task_bldc on core 1 allowed
     // xTaskCreatePinnedToCore(task_measureSpeed, "Task Speed", 2048, NULL, 1, NULL, 0);
     xTaskCreatePinnedToCore(task_leds, "Task LEDs", 4096, NULL, 2, &taskHandle_leds, 0);

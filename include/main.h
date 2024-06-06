@@ -53,3 +53,9 @@ typedef enum
     ACTIVATION,
     DEACTIVATION,
 } ActivationPhase;
+
+typedef enum
+{
+    DATE,
+    TIME,
+} DisplayMode;

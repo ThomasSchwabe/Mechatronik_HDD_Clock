@@ -1,8 +1,7 @@
 #include "main.h"
 
 /* TODO LIST
-/  use t_led_on in Timeslot calculation (fix bug)
-/  Date - Time switch
+/  use t_led_on in Timeslot calculation (fix would be nice, but not neccessary)
 /  Serial interface to init time/Date
 /  1 timer for date
 /  2 timer for time
@@ -16,7 +15,6 @@
 #define TAG_LEDS "TASK LEDS"
 
 #define DEBUG_MODE 0
-uint8_t print_timeslot_num = 100;
 
 const double angle_chamber = 18;
 const double angle_start = 76;
@@ -149,10 +147,6 @@ static bool IRAM_ATTR isr_ledProcessor_0(gptimer_handle_t timer, const gptimer_a
             ESP_ERROR_CHECK(gptimer_set_alarm_action(timerHandle_leds[ledCore], &alarmConfig));
             ESP_ERROR_CHECK(gptimer_start(timerHandle_leds[ledCore]));
         }
-        else
-        {
-            active_timeslot[ledCore] = 0;
-        }
         return true;
     }
     return true;
@@ -201,10 +195,6 @@ static bool IRAM_ATTR isr_ledProcessor_1(gptimer_handle_t timer, const gptimer_a
             alarmConfig.alarm_count = timeslots[ledCore][active_timeslot[ledCore]].time - (esp_timer_get_time() - t_error_show_phase[ledCore]);
             ESP_ERROR_CHECK(gptimer_set_alarm_action(timerHandle_leds[ledCore], &alarmConfig));
             ESP_ERROR_CHECK(gptimer_start(timerHandle_leds[ledCore]));
-        }
-        else
-        {
-            active_timeslot[ledCore] = 0;
         }
         return true;
     }
@@ -350,26 +340,23 @@ inline void sortChambers()
 
 inline void calculateAbsoluteChamberTimes()
 {
-    int64_t j = 0;
     for (int64_t i = 0; i < NUM_CHAMBERS; i++)
     {
-        for (; j < NUM_SYMBOLS; j++)
+        if (chambers[i].symbol == 'x')
         {
-            // if (chambers[i].symbol == 'x')
-            //{
-            //     chambers[i].time = -1; // TODO: FIX for time mode
-            // }
+            chambers[i].time = 0;
+            continue;
+        }
+
+        for (int8_t j = 0; j < NUM_SYMBOLS; j++)
+        {
+
             if (chambers[i].symbol == symbols[j])
+            {
+                chambers[i].time = t_chamber_start + (t_chamber_delta * i) + (t_symbol_delta * j);
                 break;
+            }
         }
-        chambers[i].time = t_chamber_start + (t_chamber_delta * i) + (t_symbol_delta * j);
-        if (DEBUG_MODE && print_timeslot_num == 0)
-        {
-            ESP_LOGI(TAG_LEDS, "chambers[i=%lld].symbol=%c -> symbols[j=%lld]=%c", i, chambers[i].symbol, j, symbols[j]);
-            ESP_LOGI(TAG_LEDS, "t_chamber_start = %lld, t_chamber_delta = %lld, t_symbol_delta = %lld, ", t_chamber_start, t_chamber_delta, t_symbol_delta);
-            ESP_LOGI(TAG_LEDS, "chambers[i=%lld]=%lu", i, chambers[i].time);
-        }
-        j = 0;
     }
 }
 
@@ -404,18 +391,11 @@ inline void calculateRelativeTimeslots(uint8_t phase)
     timeslots[phase][num_timeslots[phase]] = timeslot_buf;
     num_timeslots[phase]++;
 
-    // if (show_time)
-    //{
-    //     timeslots.erase(timeslots.begin(), timeslots.begin() + 2);       //TODO: implement without std::vector
-    // }
-    for (uint8_t i = num_timeslots[phase] - 1; i > 0; i--)
-    {
-        timeslots[phase][i].time = timeslots[phase][i].time - timeslots[phase][i - 1].time;
-    }
+    active_timeslot[phase] = (timeslots[phase][0].time == 0) ? 1 : 0;
 
-    for (uint8_t i = 0; i < num_timeslots[phase]; i++)
+    for (uint8_t i = num_timeslots[phase] - 1; i > active_timeslot[phase]; i--)
     {
-        timeslots[phase][i].time -= (i * t_led_on / 4); // TODO: FIX THIS
+        timeslots[phase][i].time = timeslots[phase][i].time - timeslots[phase][i - 1].time - (i * t_led_on / 4);
     }
 }
 
@@ -464,11 +444,11 @@ inline void printChambers()
 
 void updateDisplaySymbols(std::string newSymbols)
 {
-    uint8_t i = 0;
+    uint8_t i = NUM_CHAMBERS - 1;
     for (char c : newSymbols)
     {
         chambers[i].symbol = c;
-        i++;
+        i--;
     }
 }
 
@@ -492,15 +472,6 @@ void task_bldc(void *pvParameters)
     }
 }
 
-void task_measureSpeed(void *pvParameters)
-{
-    while (true)
-    {
-        ESP_LOGI(TAG_BLDC, "Speed=%f", 1000000.0 / (t_hall_new - t_hall_old));
-        vTaskDelay(pdMS_TO_TICKS(100));
-    }
-}
-
 void task_leds(void *pvParameters)
 {
     init_chambers();
@@ -521,17 +492,25 @@ void task_leds(void *pvParameters)
 
         processTimeslots(calculationPhase);
 
-        if (DEBUG_MODE && print_timeslot_num == 0)
+        if (DEBUG_MODE)
         {
             printChambers();
             printTimeslots(calculationPhase);
         }
-        print_timeslot_num--;
 
-        setTimerAlarm(calculationPhase, timeslots[calculationPhase][0].time);
+        setTimerAlarm(calculationPhase, timeslots[calculationPhase][active_timeslot[calculationPhase]].time);
 
         ESP_ERROR_CHECK(gptimer_start(timerHandle_leds[calculationPhase]));
         calculationPhase = !calculationPhase;
+    }
+}
+
+void task_measureSpeed(void *pvParameters)
+{
+    while (true)
+    {
+        ESP_LOGI("Speed Measurement", "%fHz", 1000000.0 / (t_hall_new - t_hall_old));
+        vTaskDelay(pdMS_TO_TICKS(1000));
     }
 }
 
@@ -550,15 +529,35 @@ void task_display(void *pvParameters)
         "9999999999",
         "::::::::::",
         "..........",
+        "....24....",
+        "7991.21.50",
+        "4321.:1234",
+        "7991021050",
+        "xxxxxxxxx1",
+        "1xxxxxxxxx",
+        "xxxxx1xxxx",
+    };
+
+    std::vector<std::string> displaySymbols_1 = {
+        "xxxxxxxxx1",
+        "xxxxxxxx12",
+        "xxxxxxx123",
+        "xxxxxx1234",
+        "xxxxx12345",
+        "xxxx123456",
+        "xxx1234567",
+        "xx12345678",
+        "x123456789",
+        "123456789x",
     };
 
     uint8_t i = 0;
     while (true)
     {
-        vTaskDelay(pdMS_TO_TICKS(500));
-        updateDisplaySymbols(displaySymbols[i]);
+        vTaskDelay(pdMS_TO_TICKS(1000));
+        updateDisplaySymbols(displaySymbols_1[i]);
         i++;
-        if (i == 12)
+        if (i == displaySymbols_1.size())
         {
             i = 0;
         }
@@ -583,6 +582,7 @@ extern "C" void app_main(void)
 
     xTaskCreatePinnedToCore(task_bldc, "Task BLDC", 6000, NULL, 2, &taskHandle_bldc, 1);
     xTaskCreatePinnedToCore(task_leds, "Task LEDs", 8000, NULL, 2, &taskHandle_leds, 0);
-    xTaskCreatePinnedToCore(task_display, "Task Display", 2000, NULL, 2, &taskHandle_display, 0);
+    xTaskCreatePinnedToCore(task_display, "Task Display", 2000, NULL, 1, &taskHandle_display, 0);
+    xTaskCreatePinnedToCore(task_measureSpeed, "Task Speed", 2000, NULL, 1, NULL, 0);
     vTaskSuspend(taskHandle_display);
 }

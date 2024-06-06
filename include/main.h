@@ -7,6 +7,8 @@
 #include "driver/gptimer.h"
 #include "driver/uart.h"
 
+#include <string>
+#include <vector>
 #include <math.h>
 
 #include "UcnBrushlessDCMotorPWM.h"

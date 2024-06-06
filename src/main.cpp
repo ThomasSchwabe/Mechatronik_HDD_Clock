@@ -1,5 +1,14 @@
 #include "main.h"
 
+/* TODO LIST
+/  use t_led_on in Timeslot calculation (fix bug)
+/  Date - Time switch
+/  Serial interface to init time/Date
+/  1 timer for date
+/  2 timer for time
+/
+*/
+
 #define LOG_LEVEL_LOCAL ESP_LOG_VERBOSE
 #include "esp_log.h"
 #define TAG_MAIN "MAIN"
@@ -11,9 +20,9 @@ uint8_t print_timeslot_num = 100;
 
 const double angle_chamber = 18;
 const double angle_start = 76;
-const double angle_on = 0.5;
+const double angle_on = 1.0;
 const double angle_symbol = 18;
-const char init_symbols[NUM_CHAMBERS + 1] = ".87654321:";
+char initSymbols[NUM_CHAMBERS + 1] = "..........";
 
 // variables time measurement/calculation
 volatile int64_t t_hall_old;
@@ -57,6 +66,7 @@ SemaphoreHandle_t semaphore_StartUpFinished = NULL;
 // Task Handles
 TaskHandle_t taskHandle_bldc = NULL;
 TaskHandle_t taskHandle_leds = NULL;
+TaskHandle_t taskHandle_display = NULL;
 
 // Task Functions
 void task_bldc(void *pvParameters);
@@ -85,6 +95,7 @@ static bool IRAM_ATTR isr_bldc_startup(gptimer_handle_t timer, const gptimer_ala
     else
     {
         xSemaphoreGiveFromISR(semaphore_StartUpFinished, NULL);
+        xTaskResumeFromISR(taskHandle_display);
     }
     timerAlarm.alarm_count = exp(exponent) * startValue_timerBldc;
     timerAlarm.reload_count = 0;
@@ -224,7 +235,7 @@ void init_chambers()
         }
         Chamber chamber = {
             .pin = (gpio_num_t)led_pins[i],
-            .symbol = init_symbols[i],
+            .symbol = initSymbols[i],
             .time = 0,
         };
         chambers[i] = chamber;
@@ -397,9 +408,14 @@ inline void calculateRelativeTimeslots(uint8_t phase)
     //{
     //     timeslots.erase(timeslots.begin(), timeslots.begin() + 2);       //TODO: implement without std::vector
     // }
-    for (uint8_t i = NUM_CHAMBERS - 1; i > 0; i--)
+    for (uint8_t i = num_timeslots[phase] - 1; i > 0; i--)
     {
         timeslots[phase][i].time = timeslots[phase][i].time - timeslots[phase][i - 1].time;
+    }
+
+    for (uint8_t i = 0; i < num_timeslots[phase]; i++)
+    {
+        timeslots[phase][i].time -= (i * t_led_on / 4); // TODO: FIX THIS
     }
 }
 
@@ -443,6 +459,16 @@ inline void printChambers()
     {
         ESP_LOGI(TAG_LEDS, "%d Chamber = %lu", j, chambers[i].time);
         j++;
+    }
+}
+
+void updateDisplaySymbols(std::string newSymbols)
+{
+    uint8_t i = 0;
+    for (char c : newSymbols)
+    {
+        chambers[i].symbol = c;
+        i++;
     }
 }
 
@@ -509,6 +535,36 @@ void task_leds(void *pvParameters)
     }
 }
 
+void task_display(void *pvParameters)
+{
+    std::vector<std::string> displaySymbols = {
+        "0000000000",
+        "1111111111",
+        "2222222222",
+        "3333333333",
+        "4444444444",
+        "5555555555",
+        "6666666666",
+        "7777777777",
+        "8888888888",
+        "9999999999",
+        "::::::::::",
+        "..........",
+    };
+
+    uint8_t i = 0;
+    while (true)
+    {
+        vTaskDelay(pdMS_TO_TICKS(500));
+        updateDisplaySymbols(displaySymbols[i]);
+        i++;
+        if (i == 12)
+        {
+            i = 0;
+        }
+    }
+}
+
 extern "C" void app_main(void)
 {
     ESP_LOGW(TAG_MAIN, "WARNING! DEBUG MODE AKTIVATED!");
@@ -527,5 +583,6 @@ extern "C" void app_main(void)
 
     xTaskCreatePinnedToCore(task_bldc, "Task BLDC", 6000, NULL, 2, &taskHandle_bldc, 1);
     xTaskCreatePinnedToCore(task_leds, "Task LEDs", 8000, NULL, 2, &taskHandle_leds, 0);
-    // xTaskCreatePinnedToCore(task_measureSpeed, "Task Speed", 8000, NULL, 2, &taskHandle_leds, 0);
+    xTaskCreatePinnedToCore(task_display, "Task Display", 2000, NULL, 2, &taskHandle_display, 0);
+    vTaskSuspend(taskHandle_display);
 }

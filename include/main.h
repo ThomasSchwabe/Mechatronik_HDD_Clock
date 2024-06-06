@@ -5,8 +5,12 @@
 #include "driver/gpio.h"
 #include "esp_timer.h"
 #include "driver/gptimer.h"
-#include "driver/uart.h"
+#include "esp_system.h"
+#include "esp_console.h"
+#include "nvs.h"
+#include "nvs_flash.h"
 
+#include <stdio.h>
 #include <string>
 #include <vector>
 #include <math.h>

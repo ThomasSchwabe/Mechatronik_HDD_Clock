@@ -1,11 +1,10 @@
 #include "main.h"
 
 /* TODO LIST
-/  use t_led_on in Timeslot calculation (fix would be nice, but not neccessary)
 /  Serial interface to init time/Date
 /  1 timer for date
 /  2 timer for time
-/
+/  use t_led_on in Timeslot calculation (fix would be nice, but not neccessary)
 */
 
 #define LOG_LEVEL_LOCAL ESP_LOG_VERBOSE
@@ -14,13 +13,14 @@
 #define TAG_BLDC "TASK BLDC"
 #define TAG_LEDS "TASK LEDS"
 
+#define PROMPT_STR CONFIG_IDF_TARGET
+
 #define DEBUG_MODE 0
 
 const double angle_chamber = 18;
 const double angle_start = 76;
 const double angle_on = 1.0;
 const double angle_symbol = 18;
-char initSymbols[NUM_CHAMBERS + 1] = "..........";
 
 // variables time measurement/calculation
 volatile int64_t t_hall_old;
@@ -225,7 +225,7 @@ void init_chambers()
         }
         Chamber chamber = {
             .pin = (gpio_num_t)led_pins[i],
-            .symbol = initSymbols[i],
+            .symbol = 'x',
             .time = 0,
         };
         chambers[i] = chamber;
@@ -498,8 +498,11 @@ void task_leds(void *pvParameters)
             printTimeslots(calculationPhase);
         }
 
+        if (num_timeslots[calculationPhase] == 1 && timeslots[calculationPhase][0].time == 0)
+        {
+            continue;
+        }
         setTimerAlarm(calculationPhase, timeslots[calculationPhase][active_timeslot[calculationPhase]].time);
-
         ESP_ERROR_CHECK(gptimer_start(timerHandle_leds[calculationPhase]));
         calculationPhase = !calculationPhase;
     }
@@ -540,15 +543,25 @@ void task_display(void *pvParameters)
 
     std::vector<std::string> displaySymbols_1 = {
         "xxxxxxxxx1",
+        "xxxxxxxxxx",
         "xxxxxxxx12",
+        "xxxxxxxxxx",
         "xxxxxxx123",
+        "xxxxxxxxxx",
         "xxxxxx1234",
+        "xxxxxxxxxx",
         "xxxxx12345",
+        "xxxxxxxxxx",
         "xxxx123456",
+        "xxxxxxxxxx",
         "xxx1234567",
+        "xxxxxxxxxx",
         "xx12345678",
+        "xxxxxxxxxx",
         "x123456789",
+        "xxxxxxxxxx",
         "123456789x",
+        "xxxxxxxxxx",
     };
 
     uint8_t i = 0;
@@ -564,8 +577,23 @@ void task_display(void *pvParameters)
     }
 }
 
+void task_console(void *pvParameters)
+{
+}
+
 extern "C" void app_main(void)
 {
+    // nvs_flash_init();
+    // esp_console_register_help_command();
+    //
+    //// REPL (Read-Evaluate-Print-Loop) environment
+    // esp_console_repl_t *repl = NULL;
+    // esp_console_repl_config_t repl_config = ESP_CONSOLE_REPL_CONFIG_DEFAULT();
+    // repl_config.prompt = PROMPT_STR ">";
+    // esp_console_dev_uart_config_t hw_config = ESP_CONSOLE_DEV_UART_CONFIG_DEFAULT();
+    // esp_console_new_repl_uart(&hw_config, &repl_config, &repl);
+    // esp_console_start_repl(repl);
+
     ESP_LOGW(TAG_MAIN, "WARNING! DEBUG MODE AKTIVATED!");
     semaphore_StartUpFinished = xSemaphoreCreateBinary();
     semaphore_CalculationSync = xSemaphoreCreateBinary();
@@ -583,6 +611,6 @@ extern "C" void app_main(void)
     xTaskCreatePinnedToCore(task_bldc, "Task BLDC", 6000, NULL, 2, &taskHandle_bldc, 1);
     xTaskCreatePinnedToCore(task_leds, "Task LEDs", 8000, NULL, 2, &taskHandle_leds, 0);
     xTaskCreatePinnedToCore(task_display, "Task Display", 2000, NULL, 1, &taskHandle_display, 0);
-    xTaskCreatePinnedToCore(task_measureSpeed, "Task Speed", 2000, NULL, 1, NULL, 0);
+    // xTaskCreatePinnedToCore(task_console, "Task Console", 2000, NULL, 1, NULL, 0);
     vTaskSuspend(taskHandle_display);
 }

@@ -6,47 +6,52 @@
 #define TAG_BLDC "TASK BLDC"
 #define TAG_LEDS "TASK LEDS"
 
-const double angle_chamber = 16;
-const double angle_start = 186;
-const double angle_on = 1.5;
-// TODO: FIX CONSTRUCTION BECAUSE ANGLE CHAMBER VARIES AND ANGLE SYMBOL= const 18° const double angle_symbol =
+#define DEBUG_MODE 0
+uint8_t print_timeslot_num = 100;
+
+const double angle_chamber = 18;
+const double angle_start = 76;
+const double angle_on = 0.5;
+const double angle_symbol = 18;
+const char init_symbols[NUM_CHAMBERS + 1] = ".87654321:";
 
 // variables time measurement/calculation
 volatile int64_t t_hall_old;
 volatile int64_t t_hall_new;
 int64_t t_hall_delta;
 
-int64_t t_led_on;
+volatile int64_t t_led_on;
 double t_led_on_faktor;
 int64_t t_chamber_start;
 double t_chamber_start_faktor;
-int64_t t_chamber_delta;
-double t_chamber_delta_faktor;
 int64_t t_symbol_delta;
 double t_symbol_delta_faktor;
+int64_t t_chamber_delta;
+double t_chamber_delta_faktor;
 
-int64_t t_calculation_start[2];
+int64_t t_error_calculation_phase[2]; // for calculations
+volatile int64_t t_error_show_phase[2];
 
-volatile ActivationPhase leds_phase;
+volatile ActivationPhase leds_phase[2];
 
 // chamber variables
 Chamber chambers[NUM_CHAMBERS];
+Chamber sorted_chambers[NUM_CHAMBERS];
 Timeslot timeslots[2][NUM_CHAMBERS];
 uint8_t num_timeslots[2];
-volatile uint8_t showPhase = 0;
-uint8_t calculationPhase = 1;
-volatile uint8_t active_timeslot;
+volatile uint8_t active_timeslot[2] = {ACTIVATION, ACTIVATION};
+uint8_t calculationPhase = 0;
 
 // bldc variables
 UcnBrushlessDCMotorPWM bldc;
 volatile uint32_t t_bldc_delay = 1500;
-uint32_t startValue_bldc = 50;
+uint32_t startValue_timerBldc = 30;
 double exponent = 0.0;
+const double exp_increase = 0.00495;
 
 // ##########FreeRTOS Management Variables//##########//
 //  semaphores
 SemaphoreHandle_t semaphore_CalculationSync = NULL;
-SemaphoreHandle_t semaphore_phaseSync = NULL;
 SemaphoreHandle_t semaphore_StartUpFinished = NULL;
 
 // Task Handles
@@ -81,63 +86,116 @@ static bool IRAM_ATTR isr_bldc_startup(gptimer_handle_t timer, const gptimer_ala
     {
         xSemaphoreGiveFromISR(semaphore_StartUpFinished, NULL);
     }
-    timerAlarm.alarm_count = exp(exponent) * startValue_bldc;
+    timerAlarm.alarm_count = exp(exponent) * startValue_timerBldc;
     timerAlarm.reload_count = 0;
     timerAlarm.flags.auto_reload_on_alarm = true;
     ESP_ERROR_CHECK(gptimer_set_alarm_action(timerHandle_bldc, &timerAlarm));
-    exponent += 0.00495;
+    exponent += exp_increase;
     return true;
 }
 
-static bool IRAM_ATTR isr_leds(gptimer_handle_t timer, const gptimer_alarm_event_data_t *edata, void *user_ctx)
+static bool IRAM_ATTR isr_ledProcessor_0(gptimer_handle_t timer, const gptimer_alarm_event_data_t *edata, void *user_ctx)
 {
-    ESP_ERROR_CHECK(gptimer_stop(timerHandle_leds[showPhase]));
+    const uint8_t ledCore = 0;
 
-    t_calculation_start[showPhase] = esp_timer_get_time();
+    t_error_show_phase[ledCore] = esp_timer_get_time();
+    ESP_ERROR_CHECK(gptimer_stop(timerHandle_leds[ledCore]));
     gptimer_alarm_config_t alarmConfig;
-    switch (leds_phase)
+
+    switch (leds_phase[ledCore])
     {
     case ACTIVATION:
         // activate leds
-        for (uint8_t i = 0; i < timeslots[showPhase][active_timeslot].num_pins; i++)
+        for (uint8_t i = 0; i < timeslots[ledCore][active_timeslot[ledCore]].num_pins; i++)
         {
-            ESP_ERROR_CHECK(gpio_set_level(timeslots[showPhase][active_timeslot].pins[i], 1));
+            ESP_ERROR_CHECK(gpio_set_level(timeslots[ledCore][active_timeslot[ledCore]].pins[i], 1));
         }
+        leds_phase[ledCore] = DEACTIVATION;
         // setup deactivation
         alarmConfig.reload_count = 0;
         alarmConfig.flags.auto_reload_on_alarm = true;
-        alarmConfig.alarm_count = t_led_on - (esp_timer_get_time() - t_calculation_start[showPhase]);
+        alarmConfig.alarm_count = t_led_on - (esp_timer_get_time() - t_error_show_phase[ledCore]);
 
-        ESP_ERROR_CHECK(gptimer_set_alarm_action(timerHandle_leds[showPhase], &alarmConfig));
-        ESP_ERROR_CHECK(gptimer_start(timerHandle_leds[showPhase]));
-        leds_phase = DEACTIVATION;
-        break;
+        ESP_ERROR_CHECK(gptimer_set_alarm_action(timerHandle_leds[ledCore], &alarmConfig));
+        ESP_ERROR_CHECK(gptimer_start(timerHandle_leds[ledCore]));
+        return true;
 
     case DEACTIVATION:
         // deactivate leds
-        for (uint8_t i = 0; i < timeslots[showPhase][active_timeslot].num_pins; i++)
+        for (uint8_t i = 0; i < timeslots[ledCore][active_timeslot[ledCore]].num_pins; i++)
         {
-            ESP_ERROR_CHECK(gpio_set_level(timeslots[showPhase][active_timeslot].pins[i], 0));
+            ESP_ERROR_CHECK(gpio_set_level(timeslots[ledCore][active_timeslot[ledCore]].pins[i], 0));
         }
+        leds_phase[ledCore] = ACTIVATION;
+        active_timeslot[ledCore] += 1;
 
-        active_timeslot += 1;
-
-        if (active_timeslot < num_timeslots[showPhase])
+        if (active_timeslot[ledCore] < num_timeslots[ledCore])
         {
             // setup activation timer
             alarmConfig.reload_count = 0;
             alarmConfig.flags.auto_reload_on_alarm = true;
-            alarmConfig.alarm_count = timeslots[showPhase][active_timeslot].time - (esp_timer_get_time() - t_calculation_start[showPhase]);
-            ESP_ERROR_CHECK(gptimer_set_alarm_action(timerHandle_leds[showPhase], &alarmConfig));
-            ESP_ERROR_CHECK(gptimer_start(timerHandle_leds[showPhase]));
+            alarmConfig.alarm_count = timeslots[ledCore][active_timeslot[ledCore]].time - (esp_timer_get_time() - t_error_show_phase[ledCore]);
+            ESP_ERROR_CHECK(gptimer_set_alarm_action(timerHandle_leds[ledCore], &alarmConfig));
+            ESP_ERROR_CHECK(gptimer_start(timerHandle_leds[ledCore]));
         }
         else
         {
-            showPhase = !showPhase;
-            active_timeslot = 0;
+            active_timeslot[ledCore] = 0;
         }
-        leds_phase = ACTIVATION;
-        break;
+        return true;
+    }
+    return true;
+}
+
+static bool IRAM_ATTR isr_ledProcessor_1(gptimer_handle_t timer, const gptimer_alarm_event_data_t *edata, void *user_ctx)
+{
+    const uint8_t ledCore = 1;
+
+    t_error_show_phase[ledCore] = esp_timer_get_time();
+    ESP_ERROR_CHECK(gptimer_stop(timerHandle_leds[ledCore]));
+    gptimer_alarm_config_t alarmConfig;
+
+    switch (leds_phase[ledCore])
+    {
+    case ACTIVATION:
+        // activate leds
+        for (uint8_t i = 0; i < timeslots[ledCore][active_timeslot[ledCore]].num_pins; i++)
+        {
+            ESP_ERROR_CHECK(gpio_set_level(timeslots[ledCore][active_timeslot[ledCore]].pins[i], 1));
+        }
+        leds_phase[ledCore] = DEACTIVATION;
+        // setup deactivation
+        alarmConfig.reload_count = 0;
+        alarmConfig.flags.auto_reload_on_alarm = true;
+        alarmConfig.alarm_count = t_led_on - (esp_timer_get_time() - t_error_show_phase[ledCore]);
+
+        ESP_ERROR_CHECK(gptimer_set_alarm_action(timerHandle_leds[ledCore], &alarmConfig));
+        ESP_ERROR_CHECK(gptimer_start(timerHandle_leds[ledCore]));
+        return true;
+
+    case DEACTIVATION:
+        // deactivate leds
+        for (uint8_t i = 0; i < timeslots[ledCore][active_timeslot[ledCore]].num_pins; i++)
+        {
+            ESP_ERROR_CHECK(gpio_set_level(timeslots[ledCore][active_timeslot[ledCore]].pins[i], 0));
+        }
+        leds_phase[ledCore] = ACTIVATION;
+        active_timeslot[ledCore] += 1;
+
+        if (active_timeslot[ledCore] < num_timeslots[ledCore])
+        {
+            // setup activation timer
+            alarmConfig.reload_count = 0;
+            alarmConfig.flags.auto_reload_on_alarm = true;
+            alarmConfig.alarm_count = timeslots[ledCore][active_timeslot[ledCore]].time - (esp_timer_get_time() - t_error_show_phase[ledCore]);
+            ESP_ERROR_CHECK(gptimer_set_alarm_action(timerHandle_leds[ledCore], &alarmConfig));
+            ESP_ERROR_CHECK(gptimer_start(timerHandle_leds[ledCore]));
+        }
+        else
+        {
+            active_timeslot[ledCore] = 0;
+        }
+        return true;
     }
     return true;
 }
@@ -166,10 +224,14 @@ void init_chambers()
         }
         Chamber chamber = {
             .pin = (gpio_num_t)led_pins[i],
-            .symbol = symbols[0],
+            .symbol = init_symbols[i],
             .time = 0,
         };
         chambers[i] = chamber;
+        if (DEBUG_MODE)
+        {
+            ESP_LOGI(TAG_LEDS, "%d chamber.symbol = %c", i, chambers[i].symbol);
+        }
     }
 }
 
@@ -196,7 +258,7 @@ void init_timerBldc()
     ESP_ERROR_CHECK(gptimer_new_timer(&timerConfig, &timerHandle_bldc));
 
     gptimer_alarm_config_t timerAlarm;
-    timerAlarm.alarm_count = startValue_bldc;
+    timerAlarm.alarm_count = startValue_timerBldc;
     timerAlarm.reload_count = 0;
     timerAlarm.flags.auto_reload_on_alarm = true;
     ESP_ERROR_CHECK(gptimer_set_alarm_action(timerHandle_bldc, &timerAlarm));
@@ -221,7 +283,7 @@ void init_timerLeds()
     ESP_ERROR_CHECK(gptimer_new_timer(&timerConfig_leds_1, &timerHandle_leds[0]));
 
     gptimer_event_callbacks_t timerCb_leds_1;
-    timerCb_leds_1.on_alarm = isr_leds;
+    timerCb_leds_1.on_alarm = isr_ledProcessor_0;
     ESP_ERROR_CHECK(gptimer_register_event_callbacks(timerHandle_leds[0], &timerCb_leds_1, NULL));
     ESP_ERROR_CHECK(gptimer_enable(timerHandle_leds[0]));
 
@@ -234,7 +296,7 @@ void init_timerLeds()
     ESP_ERROR_CHECK(gptimer_new_timer(&timerConfig_leds_2, &timerHandle_leds[1]));
 
     gptimer_event_callbacks_t timerCb_leds_2;
-    timerCb_leds_2.on_alarm = isr_leds;
+    timerCb_leds_2.on_alarm = isr_ledProcessor_1;
     ESP_ERROR_CHECK(gptimer_register_event_callbacks(timerHandle_leds[1], &timerCb_leds_2, NULL));
     ESP_ERROR_CHECK(gptimer_enable(timerHandle_leds[1]));
 }
@@ -244,66 +306,78 @@ inline void setTimerAlarm(uint8_t phase, uint64_t alarm_count)
     gptimer_alarm_config_t timerAlarm_leds;
     timerAlarm_leds.reload_count = 0;
     timerAlarm_leds.flags.auto_reload_on_alarm = true;
-    timerAlarm_leds.alarm_count = alarm_count - (esp_timer_get_time() - t_calculation_start[phase]);
+    timerAlarm_leds.alarm_count = alarm_count - (esp_timer_get_time() - t_error_calculation_phase[phase]);
     ESP_ERROR_CHECK(gptimer_set_alarm_action(timerHandle_leds[phase], &timerAlarm_leds));
 }
 
-inline void insertionSort(Chamber chambers[])
+inline void sortChambers()
 {
+    for (uint8_t c = 0; c < NUM_CHAMBERS; c++)
+    {
+        sorted_chambers[c] = chambers[c];
+    }
+
     Chamber key;
     int i, j;
     for (i = 1; i < NUM_CHAMBERS; i++)
     {
-        key = chambers[i];
+        key = sorted_chambers[i];
         j = i - 1;
 
         // Move elements of arr[0..i-1],
         // that are greater than key,
         // to one position ahead of their
         // current position
-        while (j >= 0 && chambers[j].time > key.time)
+        while (j >= 0 && sorted_chambers[j].time > key.time)
         {
-            chambers[j + 1] = chambers[j];
+            sorted_chambers[j + 1] = sorted_chambers[j];
             j = j - 1;
         }
-        chambers[j + 1] = key;
+        sorted_chambers[j + 1] = key;
     }
 }
 
 inline void calculateAbsoluteChamberTimes()
 {
-    int j = 0;
-    for (uint8_t i = 0; i < NUM_CHAMBERS; i++)
+    int64_t j = 0;
+    for (int64_t i = 0; i < NUM_CHAMBERS; i++)
     {
         for (; j < NUM_SYMBOLS; j++)
         {
-            if (chambers[i].symbol == 'x')
-            {
-                chambers[i].time = -1;
-            }
+            // if (chambers[i].symbol == 'x')
+            //{
+            //     chambers[i].time = -1; // TODO: FIX for time mode
+            // }
             if (chambers[i].symbol == symbols[j])
                 break;
         }
-        chambers[i].time = t_chamber_start + t_chamber_delta * i + t_symbol_delta * j;
+        chambers[i].time = t_chamber_start + (t_chamber_delta * i) + (t_symbol_delta * j);
+        if (DEBUG_MODE && print_timeslot_num == 0)
+        {
+            ESP_LOGI(TAG_LEDS, "chambers[i=%lld].symbol=%c -> symbols[j=%lld]=%c", i, chambers[i].symbol, j, symbols[j]);
+            ESP_LOGI(TAG_LEDS, "t_chamber_start = %lld, t_chamber_delta = %lld, t_symbol_delta = %lld, ", t_chamber_start, t_chamber_delta, t_symbol_delta);
+            ESP_LOGI(TAG_LEDS, "chambers[i=%lld]=%lu", i, chambers[i].time);
+        }
+        j = 0;
     }
 }
 
 inline void calculateRelativeTimeslots(uint8_t phase)
 {
     // sortiere chambers nach time
-    insertionSort(chambers);
+    sortChambers();
 
     num_timeslots[phase] = 0;
     Timeslot timeslot_buf;
 
-    timeslot_buf.time = chambers[0].time;
-    timeslot_buf.pins[0] = chambers[0].pin;
+    timeslot_buf.time = sorted_chambers[0].time;
+    timeslot_buf.pins[0] = sorted_chambers[0].pin;
     timeslot_buf.num_pins = 1;
     for (uint8_t i = 1; i < NUM_CHAMBERS; i++)
     {
-        if (chambers[i].time == timeslot_buf.time)
+        if (sorted_chambers[i].time == timeslot_buf.time)
         {
-            timeslot_buf.pins[timeslot_buf.num_pins] = chambers[i].pin;
+            timeslot_buf.pins[timeslot_buf.num_pins] = sorted_chambers[i].pin;
             timeslot_buf.num_pins++;
         }
         else
@@ -311,8 +385,8 @@ inline void calculateRelativeTimeslots(uint8_t phase)
             timeslots[phase][num_timeslots[phase]] = timeslot_buf;
             num_timeslots[phase]++;
 
-            timeslot_buf.time = chambers[i].time;
-            timeslot_buf.pins[0] = chambers[i].pin;
+            timeslot_buf.time = sorted_chambers[i].time;
+            timeslot_buf.pins[0] = sorted_chambers[i].pin;
             timeslot_buf.num_pins = 1;
         }
     }
@@ -352,11 +426,13 @@ inline void printTimeslots(uint8_t phase)
 {
 
     ESP_LOGI(TAG_LEDS, "t_hall_delta = %lld ,t_led_on_faktor=%f, t_chamber_delta_faktor=%f, t_chamber_start_faktor=%f", t_hall_delta, t_led_on_faktor, t_chamber_delta_faktor, t_chamber_start_faktor);
-    int j = 0;
     for (uint8_t i = 0; i < num_timeslots[phase]; i++)
     {
-        ESP_LOGI(TAG_LEDS, "%d Timeslot = %lu", j, timeslots[phase][i].time);
-        j++;
+        ESP_LOGI(TAG_LEDS, "%d Timeslot.time = %lu", i, timeslots[phase][i].time);
+        for (int j = 0; j < timeslots[phase][i].num_pins; j++)
+        {
+            ESP_LOGI(TAG_LEDS, "%d Timeslot.pins = %d", i, timeslots[phase][i].pins[j]);
+        }
     }
 }
 
@@ -370,33 +446,32 @@ inline void printChambers()
     }
 }
 
-inline void initial_visualisation()
-{
-    if (xSemaphoreTake(semaphore_CalculationSync, portMAX_DELAY) == pdFALSE)
-        ESP_LOGE(TAG_LEDS, "semaphore_CalculationSync could not be obtained!");
-
-    t_calculation_start[showPhase] = esp_timer_get_time();
-
-    processTimeslots(showPhase);
-    // printChambers();
-    // printTimeslots(showPhase);
-
-    setTimerAlarm(showPhase, timeslots[showPhase][0].time);
-    ESP_ERROR_CHECK(gptimer_start(timerHandle_leds[showPhase]));
-}
-
 // MAIN
 void task_bldc(void *pvParameters)
 {
     bldc.begin(BLDC_MOTOR_POLE, BLDC_DRV_IN1, BLDC_DRV_IN2, BLDC_DRV_IN3, BLDC_DRV_EN1, BLDC_DRV_EN2, BLDC_DRV_EN3);
-    bldc.SetPower(100);
+    bldc.SetPower(70);
     init_hall();
+    for (int i = 0; i < 400; i++)
+    {
+        bldc.DoRotate(1);
+        delayMicroseconds(1500);
+    }
     init_timerBldc(); // timer 1
 
     while (true)
     {
-        bldc.DoRotate(7);
+        bldc.DoRotate(4);
         delayMicroseconds(t_bldc_delay);
+    }
+}
+
+void task_measureSpeed(void *pvParameters)
+{
+    while (true)
+    {
+        ESP_LOGI(TAG_BLDC, "Speed=%f", 1000000.0 / (t_hall_new - t_hall_old));
+        vTaskDelay(pdMS_TO_TICKS(100));
     }
 }
 
@@ -409,30 +484,34 @@ void task_leds(void *pvParameters)
         ESP_LOGE(TAG_LEDS, "semaphore_StartUpFinished could not be obtained!");
 
     remove_timerBldc();
-    int64_t t_debug_start;
-    int64_t t_debug_end;
-    initial_visualisation();
+    // initial_visualisation();
     while (true)
     {
-        if (xSemaphoreTake(semaphore_CalculationSync, portMAX_DELAY) == pdFALSE)
+        if (xSemaphoreTake(semaphore_CalculationSync, portMAX_DELAY) == pdFALSE) // from hall isr
+        {
             ESP_LOGE(TAG_LEDS, "semaphore_CalculationSync could not be obtained!");
-        t_debug_start = esp_timer_get_time();
-        t_calculation_start[calculationPhase] = esp_timer_get_time();
+        }
+        t_error_calculation_phase[calculationPhase] = esp_timer_get_time();
 
         processTimeslots(calculationPhase);
-        // printChambers();
-        // printTimeslots(calculationPhase);
+
+        if (DEBUG_MODE && print_timeslot_num == 0)
+        {
+            printChambers();
+            printTimeslots(calculationPhase);
+        }
+        print_timeslot_num--;
+
         setTimerAlarm(calculationPhase, timeslots[calculationPhase][0].time);
 
         ESP_ERROR_CHECK(gptimer_start(timerHandle_leds[calculationPhase]));
         calculationPhase = !calculationPhase;
-        t_debug_end = esp_timer_get_time();
-        ESP_LOGI(TAG_LEDS, "delta_time=%lld", t_debug_end - t_debug_start);
     }
 }
 
 extern "C" void app_main(void)
 {
+    ESP_LOGW(TAG_MAIN, "WARNING! DEBUG MODE AKTIVATED!");
     semaphore_StartUpFinished = xSemaphoreCreateBinary();
     semaphore_CalculationSync = xSemaphoreCreateBinary();
 
@@ -440,13 +519,13 @@ extern "C" void app_main(void)
         ESP_LOGE(TAG_MAIN, "Failed to create semaphore_StartUpFinished");
     if (semaphore_CalculationSync == NULL)
         ESP_LOGE(TAG_MAIN, "Failed to create semaphore_CalculationSync");
-    if (semaphore_phaseSync == NULL)
-        ESP_LOGE(TAG_MAIN, "Failed to create semaphore_phaseSync");
 
     t_chamber_delta_faktor = calculateTimeFactor(angle_chamber);
     t_chamber_start_faktor = calculateTimeFactor(angle_start);
+    t_symbol_delta_faktor = calculateTimeFactor(angle_symbol);
     t_led_on_faktor = calculateTimeFactor(angle_on);
 
     xTaskCreatePinnedToCore(task_bldc, "Task BLDC", 6000, NULL, 2, &taskHandle_bldc, 1);
     xTaskCreatePinnedToCore(task_leds, "Task LEDs", 8000, NULL, 2, &taskHandle_leds, 0);
+    // xTaskCreatePinnedToCore(task_measureSpeed, "Task Speed", 8000, NULL, 2, &taskHandle_leds, 0);
 }

@@ -1,9 +1,6 @@
 #include "main.h"
 
 /* TODO LIST
-/  Serial interface to init time/Date
-/  1 timer for date
-/  2 timer for time
 /  use t_led_on in Timeslot calculation (fix would be nice, but not neccessary)
 */
 
@@ -21,6 +18,12 @@ const double angle_chamber = 18;
 const double angle_start = 76;
 const double angle_on = 1.0;
 const double angle_symbol = 18;
+
+// Display variables
+DisplayMode displaymode = TIME;
+int time_data[3] = {14, 2, 52};
+int date_data[3] = {9, 6, 2024};
+std::string custom_data = "xxxxxxxxxx";
 
 // variables time measurement/calculation
 volatile int64_t t_hall_old;
@@ -64,15 +67,12 @@ SemaphoreHandle_t semaphore_StartUpFinished = NULL;
 // Task Handles
 TaskHandle_t taskHandle_bldc = NULL;
 TaskHandle_t taskHandle_leds = NULL;
-TaskHandle_t taskHandle_display = NULL;
-
-// Task Functions
-void task_bldc(void *pvParameters);
-void task_leds(void *pvParameters);
+TaskHandle_t taskHandle_test = NULL;
 
 // Timer Handles
 gptimer_handle_t timerHandle_leds[2] = {NULL, NULL};
 gptimer_handle_t timerHandle_bldc = NULL;
+TimerHandle_t timerHandle_displayTime = NULL;
 
 // ISRs
 static void IRAM_ATTR isr_hall(void *arg)
@@ -86,14 +86,13 @@ static bool IRAM_ATTR isr_bldc_startup(gptimer_handle_t timer, const gptimer_ala
 {
     gptimer_alarm_config_t timerAlarm;
 
-    if (t_bldc_delay > 100) // 69 -> 60Hz, 55 -> 72Hz, stable max =
+    if (t_bldc_delay > 69) // 69 -> 60Hz, 55 -> 72Hz, stable max =
     {
         t_bldc_delay -= 1;
     }
     else
     {
         xSemaphoreGiveFromISR(semaphore_StartUpFinished, NULL);
-        xTaskResumeFromISR(taskHandle_display);
     }
     timerAlarm.alarm_count = exp(exponent) * startValue_timerBldc;
     timerAlarm.reload_count = 0;
@@ -452,11 +451,463 @@ void updateDisplaySymbols(std::string newSymbols)
     }
 }
 
+bool isValidDate(const std::string &date)
+{
+    if (date.length() != 10 || date[2] != '.' || date[5] != '.')
+    {
+        return false;
+    }
+
+    for (int i = 0; i < date.size(); ++i)
+    {
+        if (i == 2 || i == 5)
+            continue;
+        if (!isdigit(date[i]))
+            return false;
+    }
+
+    int day = (date[0] - '0') * 10 + (date[1] - '0');
+    int month = (date[3] - '0') * 10 + (date[4] - '0');
+    int year = (date[6] - '0') * 1000 + (date[7] - '0') * 100 + (date[8] - '0') * 10 + (date[9] - '0');
+
+    if (month < 1 || month > 12)
+    {
+        return false;
+    }
+
+    if (day < 1)
+    {
+        return false;
+    }
+
+    if ((month == 4 || month == 6 || month == 9 || month == 11) && day > 30)
+    {
+        return false;
+    }
+
+    if (month == 2)
+    {
+        bool isLeapYear = (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0);
+        if (isLeapYear && day > 29)
+        {
+            return false;
+        }
+        else if (!isLeapYear && day > 28)
+        {
+            return false;
+        }
+    }
+
+    return day <= 31;
+}
+
+bool isValidTime(const std::string &time)
+{
+    if (time.length() != 8 || time[2] != ':' || time[5] != ':')
+    {
+        return false;
+    }
+
+    for (int i = 0; i < time.size(); ++i)
+    {
+        if (i == 2 || i == 5)
+            continue;
+        if (!isdigit(time[i]))
+            return false;
+    }
+
+    int hour = (time[0] - '0') * 10 + (time[1] - '0');
+    int minute = (time[3] - '0') * 10 + (time[4] - '0');
+    int second = (time[6] - '0') * 10 + (time[7] - '0');
+
+    if (hour < 0 || hour >= 24 || minute < 0 || minute >= 60 || second < 0 || second >= 60)
+    {
+        return false;
+    }
+
+    return true;
+}
+
+bool validateInput(std::string &input, DisplayMode mode)
+{
+    std::string validChars = "x:.0123456789";
+    const size_t maxLength = 10;
+
+    if (mode == DATE)
+    {
+        return isValidDate(input);
+    }
+    else if (mode == TIME)
+    {
+        if (isValidTime(input))
+        {
+            input.insert(input.begin(), 'x');
+            input.push_back('x');
+            return true;
+        }
+        return false;
+    }
+    else if (mode == CUSTOM)
+    {
+        bool hasInvalidChars = false;
+        bool isTooLong = input.length() > maxLength;
+
+        // Schritt 1: Ersetze ungültige Zeichen durch 'x'
+        for (char &c : input)
+        {
+            if (validChars.find(c) == std::string::npos)
+            {
+                c = 'x';
+                hasInvalidChars = true;
+            }
+        }
+
+        // Schritt 2: Reduziere die Länge auf maxLength (10 Zeichen)
+        if (isTooLong)
+        {
+            input = input.substr(0, maxLength);
+        }
+        // Schritt 3: Fülle den String mit 'x' auf, wenn er kürzer ist
+        else if (input.length() < maxLength)
+        {
+            input.insert(0, maxLength - input.length(), 'x');
+        }
+
+        // Ausgabe, falls der String ungültige Zeichen enthielt oder zu lang war
+        if (hasInvalidChars)
+        {
+            printf("Warnung: Der Eingabestring enthielt ungültige Zeichen, die durch 'x' ersetzt wurden.\n");
+        }
+        if (isTooLong)
+        {
+            printf("Warnung: Der Eingabestring war zu lang und wurde auf 10 Zeichen gekürzt.\n");
+        }
+        return true;
+    }
+    return false;
+}
+
+DisplayMode stringToDisplayMode(const std::string &str)
+{
+    static const std::unordered_map<std::string, DisplayMode> strToEnumMap = {
+        {"date", DATE},
+        {"time", TIME},
+        {"custom", CUSTOM},
+        {"test", TEST},
+    };
+
+    auto it = strToEnumMap.find(str);
+    if (it != strToEnumMap.end())
+    {
+        return it->second;
+    }
+    else
+    {
+        return UNKNOWN; // Rückgabe für unbekannte Werte
+    }
+}
+
+std::string timeToString()
+{
+    std::stringstream timeString;
+    timeString << "x" << std::setw(2) << std::setfill('0') << time_data[0] << ":";
+    timeString << std::setw(2) << std::setfill('0') << time_data[1] << ":";
+    timeString << std::setw(2) << std::setfill('0') << time_data[2] << "x";
+    return timeString.str();
+}
+
+std::string dateToString()
+{
+    std::stringstream dateString;
+    dateString << std::setw(2) << std::setfill('0') << date_data[0] << ".";
+    dateString << std::setw(2) << std::setfill('0') << date_data[1] << ".";
+    dateString << std::setw(4) << std::setfill('0') << date_data[2];
+    return dateString.str();
+}
+
+inline bool isLeapYear(int year)
+{
+    return (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0);
+}
+
+inline void updateDisplayDate()
+{
+    // Definiere die Anzahl der Tage pro Monat
+    std::vector<int> daysInMonth = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+
+    // Erhöhe den Tag
+    date_data[0]++;
+
+    // Überprüfe, ob der Monat angepasst werden muss
+    if (date_data[0] > daysInMonth[date_data[1] - 1] || (date_data[1] == 2 && date_data[0] > 29 && isLeapYear(date_data[2])))
+    {
+        date_data[0] = 1; // Setze den Tag auf den ersten Tag des nächsten Monats
+        date_data[1]++;   // Erhöhe den Monat
+
+        // Überprüfe, ob das Jahr angepasst werden muss
+        if (date_data[1] > 12)
+        {
+            date_data[1] = 1; // Setze den Monat auf Januar
+            date_data[2]++;   // Erhöhe das Jahr
+        }
+    }
+}
+
+void updateDisplayTime(TimerHandle_t xTimer)
+{
+
+    time_data[2] += 1;
+    if (time_data[2] >= 60)
+    {
+        time_data[2] = 0;
+        time_data[1] += 1;
+    }
+    if (time_data[1] >= 60)
+    {
+        time_data[1] = 0;
+        time_data[0] += 1;
+    }
+    if (time_data[0] >= 24)
+    {
+        time_data[0] = 0;
+        updateDisplayDate();
+    }
+
+    if (displaymode == TIME)
+        updateDisplaySymbols(timeToString());
+    if (displaymode == DATE)
+        updateDisplaySymbols(dateToString());
+}
+
+std::vector<int> extractNumbers(const std::string &str)
+{
+    std::vector<int> numbers;
+    int num = 0;
+
+    for (char ch : str)
+    {
+        if (isdigit(ch))
+        {
+            num = num * 10 + (ch - '0'); // Konvertiere das Zeichen in eine Zahl
+        }
+        else
+        {
+            if (num != 0)
+            {
+                numbers.push_back(num); // Füge die extrahierte Zahl zum Vektor hinzu
+                num = 0;                // Setze die Nummer zurück
+            }
+        }
+    }
+
+    // Füge die letzte Zahl zum Vektor hinzu, falls vorhanden
+    if (num != 0)
+    {
+        numbers.push_back(num);
+    }
+
+    return numbers;
+}
+
+// Console Functions
+int writeDisplaySymbols(int argc, char **argv)
+{
+    bool status = 0;
+    // Argumentstruktur
+    struct arg_str *str = arg_str1(NULL, NULL, "<string>", "String to be processed");
+    struct arg_end *end = arg_end(1);
+    void *argtable[] = {str, end};
+
+    // Argumente parsen
+    int nerrors = arg_parse(argc, argv, argtable);
+    if (nerrors != 0)
+    {
+        arg_print_errors(stderr, end, argv[0]);
+        return 1;
+    }
+
+    // Verarbeite den eingegebenen String
+    std::string value = str->sval[0];
+
+    std::vector<int> inputNumbers;
+    switch (displaymode)
+    {
+    case DATE:
+        status = validateInput(value, displaymode);
+        if (status)
+        {
+            inputNumbers = extractNumbers(value);
+            date_data[0] = inputNumbers[0];
+            date_data[1] = inputNumbers[1];
+            date_data[2] = inputNumbers[2];
+            updateDisplaySymbols(dateToString());
+        }
+        break;
+    case TIME:
+        status = validateInput(value, displaymode);
+        if (status)
+        {
+            inputNumbers = extractNumbers(value);
+            time_data[0] = inputNumbers[0];
+            time_data[1] = inputNumbers[1];
+            time_data[2] = inputNumbers[2];
+            updateDisplaySymbols(timeToString());
+        }
+        break;
+    case CUSTOM:
+        status = validateInput(value, displaymode);
+        if (status)
+        {
+            custom_data = value;
+            updateDisplaySymbols(custom_data);
+        }
+        break;
+    default:
+        printf("write not allowed in this mode!");
+        break;
+    }
+
+    // Speicher freigeben
+    arg_freetable(argtable, sizeof(argtable) / sizeof(argtable[0]));
+    return !status;
+}
+static const esp_console_cmd_t cmdConfig_updateDisplaySymbols = {
+    .command = "write",                                 // Name des Befehls
+    .help = "Send symbols to display. 10 symbols max.", // Hilfe-Text für den Befehl
+    .hint = NULL,
+    .func = &writeDisplaySymbols, // Funktionszeiger auf die Befehlsfunktion
+    .argtable = NULL,
+};
+
+int switchMode(int argc, char **argv)
+{
+    // Argumentstruktur
+    struct arg_str *str = arg_str1(NULL, NULL, "<string>", "String to be processed");
+    struct arg_end *end = arg_end(1);
+    void *argtable[] = {str, end};
+
+    // Argumente parsen
+    int nerrors = arg_parse(argc, argv, argtable);
+    if (nerrors != 0)
+    {
+        arg_print_errors(stderr, end, argv[0]);
+        return 1;
+    }
+
+    // Verarbeite den eingegebenen String
+    std::string value = str->sval[0];
+    DisplayMode mode = stringToDisplayMode(value);
+
+    switch (mode)
+    {
+    case TIME:
+        displaymode = TIME;
+        if (taskHandle_test != NULL)
+            vTaskSuspend(taskHandle_test);
+        updateDisplaySymbols(timeToString());
+        break;
+    case DATE:
+        displaymode = DATE;
+        if (taskHandle_test != NULL)
+            vTaskSuspend(taskHandle_test);
+        updateDisplaySymbols(dateToString());
+        break;
+    case CUSTOM:
+        displaymode = CUSTOM;
+        if (taskHandle_test != NULL)
+            vTaskSuspend(taskHandle_test);
+        updateDisplaySymbols(custom_data);
+        break;
+    case TEST:
+        displaymode = TEST;
+        vTaskResume(taskHandle_test);
+        break;
+    case UNKNOWN:
+        printf("Mode unknown. Valid modes: time, date, test, custom");
+        break;
+    }
+
+    // Speicher freigeben
+    arg_freetable(argtable, sizeof(argtable) / sizeof(argtable[0]));
+
+    return 0; // Rückgabe 0 bedeutet, dass der Befehl erfolgreich war
+}
+static const esp_console_cmd_t cmdConfig_switchMode = {
+    .command = "mode",                               // Name des Befehls
+    .help = "Valid modes: time, date, test, custom", // Hilfe-Text für den Befehl
+    .hint = NULL,
+    .func = &switchMode, // Funktionszeiger auf die Befehlsfunktion
+    .argtable = NULL,
+};
+
+int printVariables(int argc, char **argv)
+{
+    bool status;
+    // Argumentstruktur
+    struct arg_str *str = arg_str1(NULL, NULL, "<string>", "String to be processed");
+    struct arg_end *end = arg_end(1);
+    void *argtable[] = {str, end};
+
+    // Argumente parsen
+    int nerrors = arg_parse(argc, argv, argtable);
+    if (nerrors != 0)
+    {
+        arg_print_errors(stderr, end, argv[0]);
+        return 1;
+    }
+
+    // Verarbeite den eingegebenen String
+    std::string value = str->sval[0];
+    if (value == "savedTime")
+    {
+        printf("savedTime=%s\n", timeToString().c_str());
+        status = true;
+    }
+    else if (value == "savedDate")
+    {
+        printf("savedDate=%s\n", dateToString().c_str());
+        status = true;
+    }
+    else
+    {
+        status = false;
+    }
+
+    // Speicher freigeben
+    arg_freetable(argtable, sizeof(argtable) / sizeof(argtable[0]));
+    return !status;
+}
+static const esp_console_cmd_t cmdConfig_printVariables = {
+    .command = "print",                            // Name des Befehls
+    .help = "Used for debugging. Prints variable", // Hilfe-Text für den Befehl
+    .hint = NULL,
+    .func = &printVariables, // Funktionszeiger auf die Befehlsfunktion
+    .argtable = NULL,
+};
+
+inline void init_console()
+{
+    ESP_ERROR_CHECK(nvs_flash_init());
+    ESP_ERROR_CHECK(esp_console_register_help_command());
+
+    ESP_ERROR_CHECK(esp_console_cmd_register(&cmdConfig_updateDisplaySymbols));
+    ESP_ERROR_CHECK(esp_console_cmd_register(&cmdConfig_switchMode));
+    ESP_ERROR_CHECK(esp_console_cmd_register(&cmdConfig_printVariables));
+
+    // REPL (Read-Evaluate-Print-Loop) environment
+    esp_console_repl_t *repl = NULL;
+    esp_console_repl_config_t repl_config = ESP_CONSOLE_REPL_CONFIG_DEFAULT();
+    repl_config.prompt = PROMPT_STR ">";
+    esp_console_dev_uart_config_t hw_config = ESP_CONSOLE_DEV_UART_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_console_new_repl_uart(&hw_config, &repl_config, &repl));
+    ESP_ERROR_CHECK(esp_console_start_repl(repl));
+}
+
 // MAIN
 void task_bldc(void *pvParameters)
 {
     bldc.begin(BLDC_MOTOR_POLE, BLDC_DRV_IN1, BLDC_DRV_IN2, BLDC_DRV_IN3, BLDC_DRV_EN1, BLDC_DRV_EN2, BLDC_DRV_EN3);
-    bldc.SetPower(70);
+    bldc.SetPower(80);
     init_hall();
     for (int i = 0; i < 400; i++)
     {
@@ -517,7 +968,7 @@ void task_measureSpeed(void *pvParameters)
     }
 }
 
-void task_display(void *pvParameters)
+void task_displayTest(void *pvParameters)
 {
     std::vector<std::string> displaySymbols = {
         "0000000000",
@@ -536,12 +987,6 @@ void task_display(void *pvParameters)
         "7991.21.50",
         "4321.:1234",
         "7991021050",
-        "xxxxxxxxx1",
-        "1xxxxxxxxx",
-        "xxxxx1xxxx",
-    };
-
-    std::vector<std::string> displaySymbols_1 = {
         "xxxxxxxxx1",
         "xxxxxxxxxx",
         "xxxxxxxx12",
@@ -567,32 +1012,18 @@ void task_display(void *pvParameters)
     uint8_t i = 0;
     while (true)
     {
-        vTaskDelay(pdMS_TO_TICKS(1000));
-        updateDisplaySymbols(displaySymbols_1[i]);
+        vTaskDelay(pdMS_TO_TICKS(500));
+        updateDisplaySymbols(displaySymbols[i]);
         i++;
-        if (i == displaySymbols_1.size())
+        if (i == displaySymbols.size())
         {
             i = 0;
         }
     }
 }
 
-void task_console(void *pvParameters)
-{
-}
-
 extern "C" void app_main(void)
 {
-    // nvs_flash_init();
-    // esp_console_register_help_command();
-    //
-    //// REPL (Read-Evaluate-Print-Loop) environment
-    // esp_console_repl_t *repl = NULL;
-    // esp_console_repl_config_t repl_config = ESP_CONSOLE_REPL_CONFIG_DEFAULT();
-    // repl_config.prompt = PROMPT_STR ">";
-    // esp_console_dev_uart_config_t hw_config = ESP_CONSOLE_DEV_UART_CONFIG_DEFAULT();
-    // esp_console_new_repl_uart(&hw_config, &repl_config, &repl);
-    // esp_console_start_repl(repl);
 
     ESP_LOGW(TAG_MAIN, "WARNING! DEBUG MODE AKTIVATED!");
     semaphore_StartUpFinished = xSemaphoreCreateBinary();
@@ -610,7 +1041,19 @@ extern "C" void app_main(void)
 
     xTaskCreatePinnedToCore(task_bldc, "Task BLDC", 6000, NULL, 2, &taskHandle_bldc, 1);
     xTaskCreatePinnedToCore(task_leds, "Task LEDs", 8000, NULL, 2, &taskHandle_leds, 0);
-    xTaskCreatePinnedToCore(task_display, "Task Display", 2000, NULL, 1, &taskHandle_display, 0);
-    // xTaskCreatePinnedToCore(task_console, "Task Console", 2000, NULL, 1, NULL, 0);
-    vTaskSuspend(taskHandle_display);
+    xTaskCreatePinnedToCore(task_displayTest, "Task Display", 2000, NULL, 1, &taskHandle_test, 0);
+    vTaskSuspend(taskHandle_test);
+
+    timerHandle_displayTime = xTimerCreate("Display-Time", pdMS_TO_TICKS(1000), pdTRUE, NULL, updateDisplayTime);
+    if (timerHandle_displayTime == NULL)
+    {
+        ESP_LOGE(TAG_MAIN, "Could not create display timer!");
+    }
+    else
+    {
+        if (xTimerStart(timerHandle_displayTime, 0) != pdPASS)
+            ESP_LOGE(TAG_MAIN, "Could not start display timer!");
+    }
+
+    init_console();
 }

@@ -9,11 +9,17 @@
 #include "esp_console.h"
 #include "nvs.h"
 #include "nvs_flash.h"
+#include "argtable3/argtable3.h"
 
 #include <stdio.h>
 #include <string>
+#include <sstream>
+#include <iomanip>
 #include <vector>
 #include <math.h>
+#include <unordered_map>
+#include <regex>
+#include <algorithm>
 
 #include "UcnBrushlessDCMotorPWM.h"
 
@@ -62,4 +68,7 @@ typedef enum
 {
     DATE,
     TIME,
+    CUSTOM,
+    TEST,
+    UNKNOWN,
 } DisplayMode;

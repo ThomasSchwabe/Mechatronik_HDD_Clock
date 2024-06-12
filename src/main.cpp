@@ -4,7 +4,7 @@
 /  use t_led_on in Timeslot calculation (fix would be nice, but not neccessary)
 */
 
-#define LOG_LEVEL_LOCAL ESP_LOG_VERBOSE
+#define LOG_LEVEL_LOCAL ESP_LOG_NONE
 #include "esp_log.h"
 #define TAG_MAIN "MAIN"
 #define TAG_BLDC "TASK BLDC"
@@ -772,8 +772,8 @@ int writeDisplaySymbols(int argc, char **argv)
     return !status;
 }
 static const esp_console_cmd_t cmdConfig_updateDisplaySymbols = {
-    .command = "write",                                 // Name des Befehls
-    .help = "Send symbols to display. 10 symbols max.", // Hilfe-Text für den Befehl
+    .command = "write",                                                                          // Name des Befehls
+    .help = "Change the displayed symbols of current mode. Symbol pattern must match the mode.", // Hilfe-Text für den Befehl
     .hint = NULL,
     .func = &writeDisplaySymbols, // Funktionszeiger auf die Befehlsfunktion
     .argtable = NULL,
@@ -833,8 +833,8 @@ int switchMode(int argc, char **argv)
     return 0; // Rückgabe 0 bedeutet, dass der Befehl erfolgreich war
 }
 static const esp_console_cmd_t cmdConfig_switchMode = {
-    .command = "mode",                               // Name des Befehls
-    .help = "Valid modes: time, date, test, custom", // Hilfe-Text für den Befehl
+    .command = "mode",                                                                     // Name des Befehls
+    .help = "Can be used to switch display modes. Valid modes: time, date, test, custom.", // Hilfe-Text für den Befehl
     .hint = NULL,
     .func = &switchMode, // Funktionszeiger auf die Befehlsfunktion
     .argtable = NULL,
@@ -885,6 +885,27 @@ static const esp_console_cmd_t cmdConfig_printVariables = {
     .argtable = NULL,
 };
 
+int clearDisplay(int argc, char **argv)
+{
+    if (displaymode == CUSTOM)
+    {
+        custom_data = "xxxxxxxxxx";
+        updateDisplaySymbols(custom_data);
+        return 0;
+    }
+    else
+    {
+        return 1;
+    }
+}
+static const esp_console_cmd_t cmdConfig_clear = {
+    .command = "clear",                                         // Name des Befehls
+    .help = "Can be used to clear the display in custom mode.", // Hilfe-Text für den Befehl
+    .hint = NULL,
+    .func = &clearDisplay, // Funktionszeiger auf die Befehlsfunktion
+    .argtable = NULL,
+};
+
 inline void init_console()
 {
     ESP_ERROR_CHECK(nvs_flash_init());
@@ -892,7 +913,8 @@ inline void init_console()
 
     ESP_ERROR_CHECK(esp_console_cmd_register(&cmdConfig_updateDisplaySymbols));
     ESP_ERROR_CHECK(esp_console_cmd_register(&cmdConfig_switchMode));
-    ESP_ERROR_CHECK(esp_console_cmd_register(&cmdConfig_printVariables));
+    ESP_ERROR_CHECK(esp_console_cmd_register(&cmdConfig_clear));
+    // ESP_ERROR_CHECK(esp_console_cmd_register(&cmdConfig_printVariables));
 
     // REPL (Read-Evaluate-Print-Loop) environment
     esp_console_repl_t *repl = NULL;

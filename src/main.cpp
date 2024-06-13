@@ -14,9 +14,12 @@
 
 #define DEBUG_MODE 0
 
+#define OFF 1
+#define ON 0
+
 const double angle_chamber = 18;
 const double angle_start = 76;
-const double angle_on = 1.0;
+const double angle_on = 0.5;
 const double angle_symbol = 18;
 
 // Display variables
@@ -68,6 +71,7 @@ SemaphoreHandle_t semaphore_StartUpFinished = NULL;
 TaskHandle_t taskHandle_bldc = NULL;
 TaskHandle_t taskHandle_leds = NULL;
 TaskHandle_t taskHandle_test = NULL;
+TaskHandle_t taskHandle_speed = NULL;
 
 // Timer Handles
 gptimer_handle_t timerHandle_leds[2] = {NULL, NULL};
@@ -116,7 +120,7 @@ static bool IRAM_ATTR isr_ledProcessor_0(gptimer_handle_t timer, const gptimer_a
         // activate leds
         for (uint8_t i = 0; i < timeslots[ledCore][active_timeslot[ledCore]].num_pins; i++)
         {
-            ESP_ERROR_CHECK(gpio_set_level(timeslots[ledCore][active_timeslot[ledCore]].pins[i], 1));
+            ESP_ERROR_CHECK(gpio_set_level(timeslots[ledCore][active_timeslot[ledCore]].pins[i], ON));
         }
         leds_phase[ledCore] = DEACTIVATION;
         // setup deactivation
@@ -132,7 +136,7 @@ static bool IRAM_ATTR isr_ledProcessor_0(gptimer_handle_t timer, const gptimer_a
         // deactivate leds
         for (uint8_t i = 0; i < timeslots[ledCore][active_timeslot[ledCore]].num_pins; i++)
         {
-            ESP_ERROR_CHECK(gpio_set_level(timeslots[ledCore][active_timeslot[ledCore]].pins[i], 0));
+            ESP_ERROR_CHECK(gpio_set_level(timeslots[ledCore][active_timeslot[ledCore]].pins[i], OFF));
         }
         leds_phase[ledCore] = ACTIVATION;
         active_timeslot[ledCore] += 1;
@@ -165,7 +169,7 @@ static bool IRAM_ATTR isr_ledProcessor_1(gptimer_handle_t timer, const gptimer_a
         // activate leds
         for (uint8_t i = 0; i < timeslots[ledCore][active_timeslot[ledCore]].num_pins; i++)
         {
-            ESP_ERROR_CHECK(gpio_set_level(timeslots[ledCore][active_timeslot[ledCore]].pins[i], 1));
+            ESP_ERROR_CHECK(gpio_set_level(timeslots[ledCore][active_timeslot[ledCore]].pins[i], ON));
         }
         leds_phase[ledCore] = DEACTIVATION;
         // setup deactivation
@@ -181,7 +185,7 @@ static bool IRAM_ATTR isr_ledProcessor_1(gptimer_handle_t timer, const gptimer_a
         // deactivate leds
         for (uint8_t i = 0; i < timeslots[ledCore][active_timeslot[ledCore]].num_pins; i++)
         {
-            ESP_ERROR_CHECK(gpio_set_level(timeslots[ledCore][active_timeslot[ledCore]].pins[i], 0));
+            ESP_ERROR_CHECK(gpio_set_level(timeslots[ledCore][active_timeslot[ledCore]].pins[i], OFF));
         }
         leds_phase[ledCore] = ACTIVATION;
         active_timeslot[ledCore] += 1;
@@ -213,7 +217,7 @@ void init_chambers()
     {
         conf = {
             .pin_bit_mask = (1ULL << led_pins[i]),
-            .mode = GPIO_MODE_OUTPUT,
+            .mode = GPIO_MODE_OUTPUT_OD,
             .pull_up_en = GPIO_PULLUP_DISABLE,
             .pull_down_en = GPIO_PULLDOWN_DISABLE,
             .intr_type = GPIO_INTR_DISABLE};
@@ -228,6 +232,7 @@ void init_chambers()
             .time = 0,
         };
         chambers[i] = chamber;
+        ESP_ERROR_CHECK(gpio_set_level(chambers[i].pin, OFF));
         if (DEBUG_MODE)
         {
             ESP_LOGI(TAG_LEDS, "%d chamber.symbol = %c", i, chambers[i].symbol);
@@ -906,6 +911,19 @@ static const esp_console_cmd_t cmdConfig_clear = {
     .argtable = NULL,
 };
 
+int printSpeed(int argc, char **argv)
+{
+    printf("speed = %fHz\n", 1000000.0 / (t_hall_new - t_hall_old));
+    return 0; // Rückgabe 0 bedeutet, dass der Befehl erfolgreich war
+}
+static const esp_console_cmd_t cmdConfig_printSpeed = {
+    .command = "speed",             // Name des Befehls
+    .help = "prints current speed", // Hilfe-Text für den Befehl
+    .hint = NULL,
+    .func = &printSpeed, // Funktionszeiger auf die Befehlsfunktion
+    .argtable = NULL,
+};
+
 inline void init_console()
 {
     ESP_ERROR_CHECK(nvs_flash_init());
@@ -914,6 +932,7 @@ inline void init_console()
     ESP_ERROR_CHECK(esp_console_cmd_register(&cmdConfig_updateDisplaySymbols));
     ESP_ERROR_CHECK(esp_console_cmd_register(&cmdConfig_switchMode));
     ESP_ERROR_CHECK(esp_console_cmd_register(&cmdConfig_clear));
+    ESP_ERROR_CHECK(esp_console_cmd_register(&cmdConfig_printSpeed));
     // ESP_ERROR_CHECK(esp_console_cmd_register(&cmdConfig_printVariables));
 
     // REPL (Read-Evaluate-Print-Loop) environment
@@ -986,7 +1005,7 @@ void task_measureSpeed(void *pvParameters)
     while (true)
     {
         ESP_LOGI("Speed Measurement", "%fHz", 1000000.0 / (t_hall_new - t_hall_old));
-        vTaskDelay(pdMS_TO_TICKS(1000));
+        vTaskDelay(pdMS_TO_TICKS(250));
     }
 }
 
@@ -1065,6 +1084,8 @@ extern "C" void app_main(void)
     xTaskCreatePinnedToCore(task_leds, "Task LEDs", 8000, NULL, 2, &taskHandle_leds, 0);
     xTaskCreatePinnedToCore(task_displayTest, "Task Display", 2000, NULL, 1, &taskHandle_test, 0);
     vTaskSuspend(taskHandle_test);
+    // xTaskCreatePinnedToCore(task_measureSpeed, "Task Speed", 2000, NULL, 1, &taskHandle_speed, 0);
+    // vTaskSuspend(taskHandle_speed);
 
     timerHandle_displayTime = xTimerCreate("Display-Time", pdMS_TO_TICKS(1000), pdTRUE, NULL, updateDisplayTime);
     if (timerHandle_displayTime == NULL)
